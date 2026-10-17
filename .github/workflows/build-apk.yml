@@ -1,0 +1,45 @@
+name: App Factory APK Builder
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build APK
+        run: |
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk com_studio_appfactory.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppFactory-APK
+          path: com_studio_appfactory.apk
+
+      - name: Publish Direct Release APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v-1792247435306
+          name: "App Factory (1.0.0)"
+          files: com_studio_appfactory.apk
