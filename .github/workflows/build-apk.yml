@@ -26,20 +26,27 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Build APK
+      - name: Generate 10000-Day Signing Certificate (27+ Years Validity)
+        run: |
+          mkdir -p ~/.android
+          rm -f ~/.android/debug.keystore app/release-key.jks
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
+          cp ~/.android/debug.keystore app/release-key.jks
+
+      - name: Build APK (10000 Days Validity)
         run: |
           gradle assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk com_studio_appfactory.apk
+          cp app/build/outputs/apk/debug/app-debug.apk com_studio_monjez.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: AppFactory-APK
-          path: com_studio_appfactory.apk
+          path: com_studio_monjez.apk
 
       - name: Publish Direct Release APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v-1792487068503
-          name: "App Factory (3.0.0)"
-          files: com_studio_appfactory.apk
+          tag_name: v-1792489608075
+          name: "مُنجز (1.0.0)"
+          files: com_studio_monjez.apk
