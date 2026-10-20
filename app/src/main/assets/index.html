@@ -2219,7 +2219,14 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Build APK
+      - name: Generate 10000-Day Signing Certificate (27+ Years Validity)
+        run: |
+          mkdir -p ~/.android
+          rm -f ~/.android/debug.keystore app/release-key.jks
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
+          cp ~/.android/debug.keystore app/release-key.jks
+
+      - name: Build APK (10000 Days Validity)
         run: |
           gradle assembleDebug
           cp app/build/outputs/apk/debug/app-debug.apk ${outApkName}
@@ -2371,7 +2378,7 @@ public class SmartAppWidget extends AppWidgetProvider {
         'settings.gradle': `pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = "AppFactoryProject"\ninclude ':app'`,
         'build.gradle': `plugins { id 'com.android.application' version '8.2.2' apply false }`,
         'gradle.properties': `org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true`,
-        'app/build.gradle': `plugins { id 'com.android.application' }\nandroid {\n  namespace '${pkg}'\n  compileSdk 34\n  defaultConfig {\n    applicationId "${pkg}"\n    minSdk 23\n    targetSdk 34\n    versionCode ${verCode}\n    versionName "${verName}"\n  }\n  compileOptions {\n    sourceCompatibility JavaVersion.VERSION_1_8\n    targetCompatibility JavaVersion.VERSION_1_8\n  }\n}\ndependencies {}`,
+        'app/build.gradle': `plugins { id 'com.android.application' }\nandroid {\n  namespace '${pkg}'\n  compileSdk 34\n  defaultConfig {\n    applicationId "${pkg}"\n    minSdk 23\n    targetSdk 34\n    versionCode ${verCode}\n    versionName "${verName}"\n  }\n  signingConfigs {\n    longTermKey {\n      storeFile file("release-key.jks")\n      storePassword "android"\n      keyAlias "androiddebugkey"\n      keyPassword "android"\n    }\n  }\n  buildTypes {\n    debug {\n      if (file("release-key.jks").exists()) {\n        signingConfig signingConfigs.longTermKey\n      }\n    }\n    release {\n      minifyEnabled false\n      if (file("release-key.jks").exists()) {\n        signingConfig signingConfigs.longTermKey\n      }\n    }\n  }\n  compileOptions {\n    sourceCompatibility JavaVersion.VERSION_1_8\n    targetCompatibility JavaVersion.VERSION_1_8\n  }\n}\ndependencies {}`,
         'app/src/main/AndroidManifest.xml': manifestXml,
         [`app/src/main/java/${pkgPath}/MainActivity.java`]: mainActivityJava,
         'app/src/main/assets/index.html': prepareSafeHtml(htmlEditor.value),
