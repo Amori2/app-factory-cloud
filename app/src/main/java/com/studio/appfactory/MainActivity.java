@@ -355,7 +355,7 @@ public class MainActivity extends Activity {
                 File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
                 File targetDir = baseDir;
                 if (folderName != null && !folderName.trim().isEmpty()) {
-                    String safeFolder = folderName.trim().replaceAll("[\\/:*?"<>|]", "_");
+                    String safeFolder = folderName.trim().replace("..", "").replace('/', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('<', '_').replace('>', '_').replace('|', '_');
                     targetDir = new File(baseDir, safeFolder);
                 }
                 if (!targetDir.exists()) targetDir.mkdirs();
@@ -384,18 +384,13 @@ public class MainActivity extends Activity {
                 if (obj.has("primaryColor")) ed.putString("primaryColor", obj.optString("primaryColor", "#458AFF"));
                 if (obj.has("bgColor")) ed.putString("bgColor", obj.optString("bgColor", "#141C2B"));
                 ed.apply();
-                SmartAppWidget.updateAllWidgets(activity);
+                
             } catch (Exception ignored) {}
         }
 
         @JavascriptInterface
         public void updateTimerNotification(final String modeTitle, final String timeStr, final String taskName, final boolean isRunning) {
-            activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    activity.showOrUpdateLockScreenTimer(modeTitle, timeStr, taskName, isRunning);
-                }
-            });
+            
         }
     }
 

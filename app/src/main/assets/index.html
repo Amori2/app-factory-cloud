@@ -79,9 +79,9 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
     badge.id = 'af-injected-version-badge';
     badge.dir = 'ltr';
     badge.textContent = "v4.0.0";
-    var shapeCss = "circle" === 'circle'
+    var shapeCss = "pill" === 'circle'
       ? 'min-width:26px;height:26px;padding:0 6px;border-radius:999px;'
-      : ("circle" === 'pill' ? 'height:22px;padding:0 9px;border-radius:999px;' : 'height:23px;padding:0 8px;border-radius:7px;');
+      : ("pill" === 'pill' ? 'height:22px;padding:0 9px;border-radius:999px;' : 'height:23px;padding:0 8px;border-radius:7px;');
     var baseCss = 'display:inline-flex;align-items:center;justify-content:center;font-family:monospace,sans-serif;font-weight:800;font-size:11px;line-height:1;color:#ffffff;background:#334155;border:1px solid rgba(255,255,255,0.28);box-shadow:0 2px 8px rgba(0,0,0,0.25);user-select:none;shrink:0;vertical-align:middle;' + shapeCss;
     var pos = "title_inline";
     if (pos.indexOf('title_') === 0) {
@@ -1735,10 +1735,37 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
     // =========================================================================
     const PERSISTENT_KEYSTORE_B64 = "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";
 
+    const JAVA_KEYWORDS = new Set([
+      'abstract','assert','boolean','break','byte','case','catch','char','class','const',
+      'continue','default','do','double','else','enum','extends','final','finally','float',
+      'for','goto','if','implements','import','instanceof','int','interface','long','native',
+      'new','null','package','private','protected','public','return','short','static','strictfp',
+      'super','switch','synchronized','this','throw','throws','transient','try','void','volatile','while','true','false'
+    ]);
+
+    function sanitizeAndroidPackageName(rawInput) {
+      let cleaned = String(rawInput || 'com.studio.appfactory')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s\-]+/g, '_')
+        .replace(/[^a-z0-9_.]/g, '');
+      let parts = cleaned.split('.').map(p => p.replace(/^_+/, '')).filter(Boolean);
+      parts = parts.map(p => {
+        if (/^[0-9]/.test(p)) p = 'app_' + p;
+        if (!/^[a-z]/.test(p)) p = 'app' + p;
+        if (JAVA_KEYWORDS.has(p)) p = p + '_app';
+        return p;
+      });
+      if (parts.length === 0) return 'com.studio.appfactory';
+      if (parts.length === 1) return 'com.studio.' + parts[0];
+      return parts.join('.');
+    }
+
     function generateAndroidProject(releaseTagName, apkFileName) {
-      const appName = (document.getElementById('appName').value || 'App Factory').trim().replace(/[<>&"']/g, '');
-      const pkg = (document.getElementById('appPkg').value || 'com.studio.appfactory').trim().replace(/[^a-zA-Z0-9_.]/g, '');
-      const verName = (document.getElementById('appVerName').value || '1.0.0').trim();
+      const appName = (document.getElementById('appName').value || 'App Factory').trim().replace(/[<>&"'`$\\]/g, '');
+      const pkg = sanitizeAndroidPackageName(document.getElementById('appPkg').value);
+      document.getElementById('appPkg').value = pkg;
+      const verName = (document.getElementById('appVerName').value || '1.0.0').trim().replace(/[<>&"'`$\\]/g, '');
       const verCode = parseInt(document.getElementById('appVerCode').value || '1', 10) || 1;
       const pkgPath = pkg.replace(/\./g, '/');
 
@@ -2184,7 +2211,7 @@ public class MainActivity extends Activity {
                 File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
                 File targetDir = baseDir;
                 if (folderName != null && !folderName.trim().isEmpty()) {
-                    String safeFolder = folderName.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+                    String safeFolder = folderName.trim().replace("..", "").replace('/', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('<', '_').replace('>', '_').replace('|', '_');
                     targetDir = new File(baseDir, safeFolder);
                 }
                 if (!targetDir.exists()) targetDir.mkdirs();
@@ -2309,11 +2336,12 @@ jobs:
       - name: Use Persistent 10000-Day Signing Certificate (Unified Key For Seamless Updates)
         run: |
           mkdir -p ~/.android
-          if [ -f "app/release-key.jks" ]; then
+          if [ -f "app/release-key.jks" ] && keytool -list -keystore app/release-key.jks -storepass android >/dev/null 2>&1; then
             cp app/release-key.jks ~/.android/debug.keystore
           else
-            keytool -genkeypair -v -keystore app/release-key.jks -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
-            cp app/release-key.jks ~/.android/debug.keystore
+            rm -f ~/.android/debug.keystore app/release-key.jks
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
+            cp ~/.android/debug.keystore app/release-key.jks
           fi
 
       - name: Build APK (10000 Days Validity)
@@ -3111,11 +3139,9 @@ public class SmartAppWidget extends AppWidgetProvider {
         const proj = generateAndroidProject(releaseTag, latestApkFileName);
 
         const refRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${branch}`, { headers });
+        if (!refRes.ok) throw new Error('تعذر قراءة فرع المستودع، تأكد من صلاحيات Token');
         const refData = await refRes.json();
         const latestCommitSha = refData.object.sha;
-        const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/commits/${latestCommitSha}`, { headers });
-        const commitData = await commitRes.json();
-        const baseTreeSha = commitData.tree.sha;
 
         const treeItems = [];
         for (const [path, content] of Object.entries(proj)) {
@@ -3125,6 +3151,7 @@ public class SmartAppWidget extends AppWidgetProvider {
             headers,
             body: JSON.stringify({ content: toBase64Utf8(content), encoding: 'base64' })
           });
+          if (!bRes.ok) throw new Error(`فشل رفع الملف النصي: ${path}`);
           const bData = await bRes.json();
           treeItems.push({ path, mode: '100644', type: 'blob', sha: bData.sha });
         }
@@ -3135,15 +3162,17 @@ public class SmartAppWidget extends AppWidgetProvider {
             headers,
             body: JSON.stringify({ content: b64, encoding: 'base64' })
           });
+          if (!bRes.ok) throw new Error(`فشل رفع الملف الثنائي: ${path}`);
           const bData = await bRes.json();
           treeItems.push({ path, mode: '100644', type: 'blob', sha: bData.sha });
         }
 
-        updateProgress(55, 'جاري إرسال الحزمة الموحدة إلى خادم البناء...');
+        updateProgress(55, 'جاري إرسال الحزمة النظيفة الموحدة إلى خادم البناء...');
+        // Omit base_tree so old Java files from previous package names never remain in app/src/main/java/
         const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ base_tree: baseTreeSha, tree: treeItems })
+          body: JSON.stringify({ tree: treeItems })
         });
         const treeData = await treeRes.json();
 
@@ -3180,7 +3209,21 @@ public class SmartAppWidget extends AppWidgetProvider {
                 finishedRun = run;
                 break;
               } else {
-                throw new Error('فشل البناء على الخادم، تأكد من صحة إعدادات الحزمة');
+                let failDetail = '';
+                try {
+                  const jobsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${run.id}/jobs`, { headers });
+                  const jobsData = await jobsRes.json();
+                  const jobs = jobsData.jobs || [];
+                  for (const jb of jobs) {
+                    const failedStep = (jb.steps || []).find(s => s.conclusion === 'failure');
+                    if (failedStep) {
+                      failDetail = ` (الخطوة التي فشلت: ${failedStep.name})`;
+                      logMsg(`Failed step: ${failedStep.name}`);
+                      break;
+                    }
+                  }
+                } catch (e) {}
+                throw new Error('فشل البناء على الخادم' + failDetail);
               }
             }
           }

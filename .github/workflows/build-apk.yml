@@ -29,11 +29,12 @@ jobs:
       - name: Use Persistent 10000-Day Signing Certificate (Unified Key For Seamless Updates)
         run: |
           mkdir -p ~/.android
-          if [ -f "app/release-key.jks" ]; then
+          if [ -f "app/release-key.jks" ] && keytool -list -keystore app/release-key.jks -storepass android >/dev/null 2>&1; then
             cp app/release-key.jks ~/.android/debug.keystore
           else
-            keytool -genkeypair -v -keystore app/release-key.jks -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
-            cp app/release-key.jks ~/.android/debug.keystore
+            rm -f ~/.android/debug.keystore app/release-key.jks
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=AppFactory,C=US"
+            cp ~/.android/debug.keystore app/release-key.jks
           fi
 
       - name: Build APK (10000 Days Validity)
@@ -50,6 +51,6 @@ jobs:
       - name: Publish Direct Release APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v-1792938550160
+          tag_name: v-1792939386793
           name: "App Factory (4.0.0)"
           files: com_studio_appfactory.apk
