@@ -1,13 +1,13 @@
 plugins { id 'com.android.application' }
 android {
-  namespace 'com.studio.monjez'
+  namespace 'com.studio.appfactory'
   compileSdk 34
   defaultConfig {
-    applicationId "com.studio.monjez"
+    applicationId "com.studio.appfactory"
     minSdk 23
     targetSdk 34
-    versionCode 1
-    versionName "1.0.0"
+    versionCode 5
+    versionName "4.0.0"
   }
   signingConfigs {
     longTermKey {

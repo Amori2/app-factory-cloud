@@ -4,10 +4,17 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import org.json.JSONObject;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -194,8 +201,29 @@ public class MainActivity extends Activity {
                 try {
                     Intent i = new Intent(Intent.ACTION_GET_CONTENT);
                     i.addCategory(Intent.CATEGORY_OPENABLE);
-                    i.setType("*/*");
-                    startActivityForResult(Intent.createChooser(i, "اختر ملفاً"), FILE_CHOOSER_CODE);
+                    i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    String mimeType = "*/*";
+                    if (fileChooserParams != null && fileChooserParams.getAcceptTypes() != null) {
+                        String[] types = fileChooserParams.getAcceptTypes();
+                        boolean wantsImagesOnly = false;
+                        boolean wantsPdfOnly = false;
+                        for (String t : types) {
+                            if (t == null) continue;
+                            String clean = t.trim().toLowerCase();
+                            if (clean.startsWith("image/") || clean.contains(".png") || clean.contains(".jpg") || clean.contains(".jpeg")) {
+                                wantsImagesOnly = true;
+                            } else if (clean.equals("application/pdf") || clean.equals(".pdf")) {
+                                wantsPdfOnly = true;
+                            }
+                        }
+                        if (wantsImagesOnly && !wantsPdfOnly) {
+                            mimeType = "image/*";
+                        } else if (wantsPdfOnly && !wantsImagesOnly) {
+                            mimeType = "application/pdf";
+                        }
+                    }
+                    i.setType(mimeType);
+                    startActivityForResult(Intent.createChooser(i, "اختر الملفات أو الصور (يدعم التحديد المتعدد)"), FILE_CHOOSER_CODE);
                 } catch (Exception e) {
                     MainActivity.this.filePathCallback = null;
                     return false;
@@ -259,8 +287,19 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == FILE_CHOOSER_CODE && filePathCallback != null) {
             Uri[] results = null;
-            if (resultCode == Activity.RESULT_OK && data != null && data.getDataString() != null) {
-                results = new Uri[]{Uri.parse(data.getDataString())};
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                ClipData clipData = data.getClipData();
+                if (clipData != null && clipData.getItemCount() > 0) {
+                    int count = clipData.getItemCount();
+                    results = new Uri[count];
+                    for (int i = 0; i < count; i++) {
+                        results[i] = clipData.getItemAt(i).getUri();
+                    }
+                } else if (data.getData() != null) {
+                    results = new Uri[]{ data.getData() };
+                } else if (data.getDataString() != null) {
+                    results = new Uri[]{ Uri.parse(data.getDataString()) };
+                }
             }
             filePathCallback.onReceiveValue(results);
             filePathCallback = null;
@@ -297,19 +336,112 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void saveBase64File(String base64Data, String fileName) {
+            saveBase64File(base64Data, fileName, "*/*");
+        }
+
+        @JavascriptInterface
+        public void saveBase64File(String base64Data, String fileName, String mimeType) {
+            saveBase64FileInFolder(base64Data, fileName, "", mimeType);
+        }
+
+        @JavascriptInterface
+        public void saveBase64FileInFolder(String base64Data, String fileName, String folderName, String mimeType) {
             try {
-                byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
-                File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-                if (!dir.exists()) dir.mkdirs();
-                File outFile = new File(dir, fileName);
+                String cleanB64 = base64Data;
+                if (cleanB64 != null && cleanB64.contains(",")) {
+                    cleanB64 = cleanB64.substring(cleanB64.indexOf(",") + 1);
+                }
+                byte[] bytes = Base64.decode(cleanB64, Base64.DEFAULT);
+                File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                File targetDir = baseDir;
+                if (folderName != null && !folderName.trim().isEmpty()) {
+                    String safeFolder = folderName.trim().replaceAll("[\\/:*?"<>|]", "_");
+                    targetDir = new File(baseDir, safeFolder);
+                }
+                if (!targetDir.exists()) targetDir.mkdirs();
+                File outFile = new File(targetDir, fileName);
                 FileOutputStream fos = new FileOutputStream(outFile);
                 fos.write(bytes);
                 fos.flush();
                 fos.close();
-                Toast.makeText(activity, "تم حفظ الملف في مجلد التنزيلات: " + fileName, Toast.LENGTH_LONG).show();
+                String msg = (folderName != null && !folderName.trim().isEmpty())
+                    ? ("تم حفظ الملف في Download/" + folderName.trim() + "/" + fileName)
+                    : ("تم حفظ الملف في التنزيلات: " + fileName);
+                Toast.makeText(activity, msg, Toast.LENGTH_LONG).show();
             } catch (Exception e) {
                 Toast.makeText(activity, "خطأ أثناء حفظ الملف: " + e.getMessage(), Toast.LENGTH_LONG).show();
             }
         }
+
+        @JavascriptInterface
+        public void updateWidget(String jsonPayload) {
+            try {
+                JSONObject obj = new JSONObject(jsonPayload);
+                SharedPreferences prefs = activity.getSharedPreferences("af_widget_prefs", Context.MODE_PRIVATE);
+                SharedPreferences.Editor ed = prefs.edit();
+                if (obj.has("title")) ed.putString("title", obj.optString("title", ""));
+                if (obj.has("body")) ed.putString("body", obj.optString("body", ""));
+                if (obj.has("primaryColor")) ed.putString("primaryColor", obj.optString("primaryColor", "#458AFF"));
+                if (obj.has("bgColor")) ed.putString("bgColor", obj.optString("bgColor", "#141C2B"));
+                ed.apply();
+                SmartAppWidget.updateAllWidgets(activity);
+            } catch (Exception ignored) {}
+        }
+
+        @JavascriptInterface
+        public void updateTimerNotification(final String modeTitle, final String timeStr, final String taskName, final boolean isRunning) {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    activity.showOrUpdateLockScreenTimer(modeTitle, timeStr, taskName, isRunning);
+                }
+            });
+        }
+    }
+
+    public void showOrUpdateLockScreenTimer(String modeTitle, String timeStr, String taskName, boolean isRunning) {
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            String channelId = "af_live_timer_channel";
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(
+                    channelId,
+                    "المؤقت وحاسب الجلسات",
+                    NotificationManager.IMPORTANCE_LOW
+                );
+                channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                channel.setShowBadge(false);
+                nm.createNotificationChannel(channel);
+            }
+            if (!isRunning && ("00:00".equals(timeStr) || "00:00:00".equals(timeStr))) {
+                nm.cancel(7701);
+                return;
+            }
+            Intent intent = new Intent(this, MainActivity.class);
+            intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                flags |= PendingIntent.FLAG_IMMUTABLE;
+            }
+            PendingIntent pi = PendingIntent.getActivity(this, 7701, intent, flags);
+
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                builder = new Notification.Builder(this, channelId);
+            } else {
+                builder = new Notification.Builder(this);
+            }
+            builder.setSmallIcon(R.mipmap.ic_launcher)
+                   .setContentTitle(timeStr + " • " + (modeTitle != null ? modeTitle : "المؤقت"))
+                   .setContentText(taskName != null && !taskName.isEmpty() ? taskName : "جلسة تركيز نشطة")
+                   .setContentIntent(pi)
+                   .setOngoing(isRunning)
+                   .setOnlyAlertOnce(true);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                builder.setVisibility(Notification.VISIBILITY_PUBLIC);
+            }
+            nm.notify(7701, builder.build());
+        } catch (Exception ignored) {}
     }
 }
