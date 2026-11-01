@@ -118,7 +118,10 @@ public class MainActivity extends Activity {
         String s = rawUrl.trim();
         if (!s.startsWith("http://") && !s.startsWith("https://")) return false;
         String lower = s.toLowerCase();
-        String pathOnly = lower.split("\?")[0].split("#")[0];
+        int qIdx = lower.indexOf('?');
+        String pathOnly = qIdx >= 0 ? lower.substring(0, qIdx) : lower;
+        int hIdx = pathOnly.indexOf('#');
+        if (hIdx >= 0) pathOnly = pathOnly.substring(0, hIdx);
         // Ignore individual HLS/DASH segment chunks (.ts, .m4s) so we only list full streams/files
         if (pathOnly.endsWith(".ts") || pathOnly.endsWith(".m4s") || pathOnly.endsWith(".aac") || pathOnly.endsWith(".vtt") || pathOnly.endsWith(".jpg") || pathOnly.endsWith(".png") || pathOnly.endsWith(".js") || pathOnly.endsWith(".css")) {
             return false;
@@ -228,8 +231,7 @@ public class MainActivity extends Activity {
         if (browserWebView == null) return;
         String js = "(function(){try{" +
             "var pt='';" +
-            "var og=document.querySelector('meta[property="og:title"],meta[name="twitter:title"]');" +
-            "if(og&&og.content)pt=og.content.trim();" +
+            "var ms=document.getElementsByTagName('meta');for(var m=0;m<ms.length;m++){var p=ms[m].getAttribute('property')||ms[m].getAttribute('name')||'';if(p==='og:title'||p==='twitter:title'){pt=(ms[m].getAttribute('content')||'').trim();if(pt)break;}}" +
             "if(!pt&&document.title)pt=document.title.trim();" +
             "if(window.AndroidBridge&&window.AndroidBridge.reportPageTitle&&pt)window.AndroidBridge.reportPageTitle(pt,location.href);" +
             "var els=document.querySelectorAll('video,audio,video source,audio source,source,a[href]');" +
@@ -900,8 +902,7 @@ public class MainActivity extends Activity {
                     StringBuilder sb = new StringBuilder();
                     String line;
                     while ((line = br.readLine()) != null) {
-                        sb.append(line).append("
-");
+                        sb.append(line).append((char) 10);
                     }
                     br.close();
                     return sb.toString();
@@ -983,18 +984,13 @@ public class MainActivity extends Activity {
                 if (obj.has("primaryColor")) ed.putString("primaryColor", obj.optString("primaryColor", "#458AFF"));
                 if (obj.has("bgColor")) ed.putString("bgColor", obj.optString("bgColor", "#141C2B"));
                 ed.apply();
-                SmartAppWidget.updateAllWidgets(activity);
+                
             } catch (Exception ignored) {}
         }
 
         @JavascriptInterface
         public void updateTimerNotification(final String modeTitle, final String timeStr, final String taskName, final boolean isRunning) {
-            activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    activity.showOrUpdateLockScreenTimer(modeTitle, timeStr, taskName, isRunning);
-                }
-            });
+            
         }
     }
 
