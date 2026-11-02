@@ -78,7 +78,7 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
     var badge = document.createElement('span');
     badge.id = 'af-injected-version-badge';
     badge.dir = 'ltr';
-    badge.textContent = "v5.0.0";
+    badge.textContent = "v6.0.0";
     var shapeCss = "pill" === 'circle'
       ? 'min-width:26px;height:26px;padding:0 6px;border-radius:999px;'
       : ("pill" === 'pill' ? 'height:22px;padding:0 9px;border-radius:999px;' : 'height:23px;padding:0 8px;border-radius:7px;');
@@ -1786,7 +1786,8 @@ body > *:not(#af-native-splash-overlay) { opacity: 0 !important; visibility: hid
 
       const manifestPerms = [
         '<uses-permission android:name="android.permission.INTERNET" />',
-        '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />'
+        '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
+        '<uses-permission android:name="android.permission.WAKE_LOCK" />'
       ];
       const runtimePermsJava = [];
 
@@ -1866,7 +1867,14 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.ClipData;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
+import android.media.MediaScannerConnection;
+import android.os.PowerManager;
+import android.provider.MediaStore;
+import java.io.FileInputStream;
+import java.io.OutputStream;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -1928,7 +1936,11 @@ public class MainActivity extends Activity {
     private static final int FILE_CHOOSER_CODE = 1001;
     private static final int PERMISSION_REQ_CODE = 1002;
     private static final String MOBILE_CHROME_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+    private static final String DESKTOP_4K_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+    private PowerManager.WakeLock downloadWakeLock;
+    private final Map<String, File> activeSaveTempFiles = new HashMap<String, File>();
+    private final Map<String, FileOutputStream> activeSaveStreams = new HashMap<String, FileOutputStream>();
     private volatile boolean nativeAdBlockEnabled = true;
     private volatile String currentBrowserUrl = "";
     private volatile String currentBrowserTitle = "";
@@ -1975,12 +1987,21 @@ public class MainActivity extends Activity {
         String s = rawUrl.trim();
         if (!s.startsWith("http://") && !s.startsWith("https://")) return false;
         String lower = s.toLowerCase();
+        if (lower.contains("preview") || lower.contains("thumb") || lower.contains("sprite") ||
+            lower.contains("storyboard") || lower.contains("hover") || lower.contains("bumper") ||
+            lower.contains("preroll") || lower.contains("/ads/") || lower.contains("favicon")) {
+            return false;
+        }
         int qIdx = lower.indexOf('?');
         String pathOnly = qIdx >= 0 ? lower.substring(0, qIdx) : lower;
         int hIdx = pathOnly.indexOf('#');
         if (hIdx >= 0) pathOnly = pathOnly.substring(0, hIdx);
-        // Ignore individual HLS/DASH segment chunks (.ts, .m4s) so we only list full streams/files
-        if (pathOnly.endsWith(".ts") || pathOnly.endsWith(".m4s") || pathOnly.endsWith(".aac") || pathOnly.endsWith(".vtt") || pathOnly.endsWith(".jpg") || pathOnly.endsWith(".png") || pathOnly.endsWith(".js") || pathOnly.endsWith(".css")) {
+        // Ignore individual HLS/DASH segment chunks (.ts, .m4s) and non-media assets
+        if (pathOnly.endsWith(".ts") || pathOnly.endsWith(".m4s") || pathOnly.endsWith(".aac") ||
+            pathOnly.endsWith(".vtt") || pathOnly.endsWith(".srt") || pathOnly.endsWith(".jpg") ||
+            pathOnly.endsWith(".jpeg") || pathOnly.endsWith(".png") || pathOnly.endsWith(".gif") ||
+            pathOnly.endsWith(".webp") || pathOnly.endsWith(".svg") || pathOnly.endsWith(".js") ||
+            pathOnly.endsWith(".css") || pathOnly.endsWith(".woff") || pathOnly.endsWith(".woff2")) {
             return false;
         }
         if (pathOnly.endsWith(".m3u8") || pathOnly.endsWith(".mpd") || pathOnly.endsWith(".mp4") ||
@@ -2120,8 +2141,13 @@ public class MainActivity extends Activity {
         rootLayout = new FrameLayout(this);
         rootLayout.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // 1. Primary App UI WebView (loads file:///android_asset/index.html)
-        webView = new WebView(this);
+        // 1. Primary App UI WebView (overrides onWindowVisibilityChanged so background downloads NEVER pause when switching apps!)
+        webView = new WebView(this) {
+            @Override
+            protected void onWindowVisibilityChanged(int visibility) {
+                super.onWindowVisibilityChanged(View.VISIBLE);
+            }
+        };
         try { webView.setBackgroundColor(Color.parseColor(initBgHex)); } catch (Exception ignored) { webView.setBackgroundColor(Color.parseColor("#090D16")); }
         webView.setFocusable(true);
         webView.setFocusableInTouchMode(true);
@@ -2566,6 +2592,136 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        if (webView != null) {
+            try { webView.resumeTimers(); } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (webView != null) {
+            try { webView.resumeTimers(); } catch (Exception ignored) {}
+        }
+    }
+
+    @SuppressLint("WakelockTimeout")
+    public void setDownloadWakeLock(boolean active) {
+        try {
+            if (active) {
+                if (downloadWakeLock == null) {
+                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                    if (pm != null) {
+                        downloadWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Snap1DM:BgDownloadLock");
+                        downloadWakeLock.setReferenceCounted(false);
+                    }
+                }
+                if (downloadWakeLock != null && !downloadWakeLock.isHeld()) {
+                    downloadWakeLock.acquire(2 * 60 * 60 * 1000L);
+                }
+            } else {
+                if (downloadWakeLock != null && downloadWakeLock.isHeld()) {
+                    downloadWakeLock.release();
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    public String moveTempFileToPublicDownloads(File tempFile, String fileName, String mimeType, String subFolder) {
+        if (tempFile == null || !tempFile.exists() || tempFile.length() == 0) {
+            return "ERROR:Empty temp file";
+        }
+        String safeName = (fileName != null && !fileName.trim().isEmpty()) ? fileName.trim() : ("Video_" + System.currentTimeMillis() + ".mp4");
+        safeName = safeName.replace('/', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_');
+        String safeMime = (mimeType != null && !mimeType.trim().isEmpty()) ? mimeType.trim() : (safeName.endsWith(".ts") ? "video/mp2t" : "video/mp4");
+        String cleanSub = "";
+        if (subFolder != null && !subFolder.trim().isEmpty()) {
+            String candidate = subFolder.trim().replace("..", "").replace('/', '_').replace(':', '_');
+            if (!candidate.equalsIgnoreCase("Downloads") && !candidate.equalsIgnoreCase("Download")) {
+                cleanSub = candidate;
+            }
+        }
+
+        // Method A: Official Android 10+ (API 29+) MediaStore.Downloads (works on Android 10, 11, 12, 13, 14 without storage permission issues!)
+        if (Build.VERSION.SDK_INT >= 29) {
+            FileInputStream fis = null;
+            OutputStream os = null;
+            try {
+                ContentResolver resolver = getContentResolver();
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, safeName);
+                values.put(MediaStore.MediaColumns.MIME_TYPE, safeMime);
+                String relPath = Environment.DIRECTORY_DOWNLOADS + (cleanSub.isEmpty() ? "" : ("/" + cleanSub));
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, relPath);
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                Uri itemUri = resolver.insert(collection, values);
+                if (itemUri != null) {
+                    os = resolver.openOutputStream(itemUri);
+                    if (os != null) {
+                        fis = new FileInputStream(tempFile);
+                        byte[] buf = new byte[65536];
+                        int read;
+                        while ((read = fis.read(buf)) != -1) {
+                            os.write(buf, 0, read);
+                        }
+                        os.flush();
+                        os.close();
+                        os = null;
+                        fis.close();
+                        fis = null;
+
+                        ContentValues doneValues = new ContentValues();
+                        doneValues.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                        resolver.update(itemUri, doneValues, null, null);
+                        try { tempFile.delete(); } catch (Exception ignored) {}
+                        return "OK:" + relPath + "/" + safeName;
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                try { if (fis != null) fis.close(); } catch (Exception ignored) {}
+                try { if (os != null) os.close(); } catch (Exception ignored) {}
+            }
+        }
+
+        // Method B: Direct FileOutputStream in DIRECTORY_DOWNLOADS + MediaScannerConnection (Android 6 - 9 & fallback)
+        FileInputStream fis2 = null;
+        FileOutputStream fos2 = null;
+        try {
+            File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            File targetDir = cleanSub.isEmpty() ? baseDir : new File(baseDir, cleanSub);
+            if (!targetDir.exists()) targetDir.mkdirs();
+            File outFile = new File(targetDir, safeName);
+            fis2 = new FileInputStream(tempFile);
+            fos2 = new FileOutputStream(outFile);
+            byte[] buf = new byte[65536];
+            int read;
+            while ((read = fis2.read(buf)) != -1) {
+                fos2.write(buf, 0, read);
+            }
+            fos2.flush();
+            fos2.close();
+            fos2 = null;
+            fis2.close();
+            fis2 = null;
+            try { tempFile.delete(); } catch (Exception ignored) {}
+            try {
+                MediaScannerConnection.scanFile(this, new String[]{ outFile.getAbsolutePath() }, new String[]{ safeMime }, null);
+            } catch (Exception ignored) {}
+            return "OK:" + outFile.getAbsolutePath();
+        } catch (Exception e) {
+            return "ERROR:" + e.getMessage();
+        } finally {
+            try { if (fis2 != null) fis2.close(); } catch (Exception ignored) {}
+            try { if (fos2 != null) fos2.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             if (webView != null) {
@@ -2735,9 +2891,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        @JavascriptInterface
-        public String fetchTextWithCookies(String urlStr) {
-            if (urlStr == null || (!urlStr.startsWith("http://") && !urlStr.startsWith("https://"))) return "";
+        private String executeHttpGetText(String urlStr, String userAgent) {
             HttpURLConnection conn = null;
             try {
                 URL u = new URL(urlStr);
@@ -2745,7 +2899,7 @@ public class MainActivity extends Activity {
                 conn.setConnectTimeout(15000);
                 conn.setReadTimeout(15000);
                 conn.setInstanceFollowRedirects(true);
-                conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
+                conn.setRequestProperty("User-Agent", userAgent);
                 if (activity.currentBrowserUrl != null && !activity.currentBrowserUrl.isEmpty()) {
                     conn.setRequestProperty("Referer", activity.currentBrowserUrl);
                 }
@@ -2772,6 +2926,104 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public String fetchTextWithCookies(String urlStr) {
+            if (urlStr == null || (!urlStr.startsWith("http://") && !urlStr.startsWith("https://"))) return "";
+            String mobileRes = executeHttpGetText(urlStr, MOBILE_CHROME_UA);
+            // Problem 3: If this is an M3U8 master playlist and does not yet contain 2160/4K, also probe with a 4K Desktop User-Agent!
+            if (mobileRes.contains("#EXT-X-STREAM-INF") && !mobileRes.contains("2160") && !mobileRes.contains("3840")) {
+                String desktopRes = executeHttpGetText(urlStr, DESKTOP_4K_UA);
+                if (desktopRes.contains("#EXT-X-STREAM-INF") &&
+                    (desktopRes.contains("2160") || desktopRes.contains("3840") || desktopRes.length() > mobileRes.length())) {
+                    return desktopRes;
+                }
+            }
+            if (mobileRes.isEmpty()) {
+                return executeHttpGetText(urlStr, DESKTOP_4K_UA);
+            }
+            return mobileRes;
+        }
+
+        @JavascriptInterface
+        public void setBackgroundDownloadActive(final boolean active) {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    activity.setDownloadWakeLock(active);
+                    if (active && activity.webView != null) {
+                        try { activity.webView.resumeTimers(); } catch (Exception ignored) {}
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String beginSaveFile(String fileName) {
+            try {
+                String sessionId = "save_" + System.currentTimeMillis() + "_" + Math.round(Math.random() * 10000);
+                File tempDir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (tempDir == null || !tempDir.exists()) tempDir = activity.getCacheDir();
+                File tempFile = new File(tempDir, sessionId + ".tmp");
+                FileOutputStream fos = new FileOutputStream(tempFile);
+                synchronized (activity.activeSaveStreams) {
+                    activity.activeSaveTempFiles.put(sessionId, tempFile);
+                    activity.activeSaveStreams.put(sessionId, fos);
+                }
+                return sessionId;
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public boolean appendSaveFileChunk(String sessionId, String base64Chunk) {
+            if (sessionId == null || base64Chunk == null) return false;
+            try {
+                FileOutputStream fos;
+                synchronized (activity.activeSaveStreams) {
+                    fos = activity.activeSaveStreams.get(sessionId);
+                }
+                if (fos == null) return false;
+                String cleanB64 = base64Chunk;
+                int comma = cleanB64.indexOf(',');
+                if (comma >= 0) cleanB64 = cleanB64.substring(comma + 1);
+                byte[] bytes = Base64.decode(cleanB64, Base64.DEFAULT);
+                fos.write(bytes);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public String finishSaveFile(String sessionId, final String fileName, String mimeType, String subFolder) {
+            File tempFile = null;
+            FileOutputStream fos = null;
+            synchronized (activity.activeSaveStreams) {
+                fos = activity.activeSaveStreams.remove(sessionId);
+                tempFile = activity.activeSaveTempFiles.remove(sessionId);
+            }
+            try {
+                if (fos != null) {
+                    fos.flush();
+                    fos.close();
+                }
+            } catch (Exception ignored) {}
+            if (tempFile == null || !tempFile.exists()) {
+                return "ERROR:Temp file not found";
+            }
+            final String result = activity.moveTempFileToPublicDownloads(tempFile, fileName, mimeType, subFolder);
+            if (result.startsWith("OK:")) {
+                activity.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        Toast.makeText(activity, "تم حفظ الفيديو في التنزيلات: " + fileName, Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+            return result;
+        }
+
+        @JavascriptInterface
         public void downloadUrl(String url, String fileName) {
             activity.runOnUiThread(new Runnable() {
                 @Override
@@ -2782,44 +3034,23 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void saveBase64File(String base64Data, String fileName) {
-            saveBase64File(base64Data, fileName, "*/*");
+        public boolean saveBase64File(String base64Data, String fileName) {
+            return saveBase64File(base64Data, fileName, "*/*");
         }
 
         @JavascriptInterface
-        public void saveBase64File(String base64Data, String fileName, String mimeType) {
-            saveBase64FileInFolder(base64Data, fileName, "", mimeType);
+        public boolean saveBase64File(String base64Data, String fileName, String mimeType) {
+            return saveBase64FileInFolder(base64Data, fileName, "", mimeType);
         }
 
         @JavascriptInterface
-        public void saveBase64FileInFolder(String base64Data, String fileName, String folderName, String mimeType) {
+        public boolean saveBase64FileInFolder(String base64Data, final String fileName, String folderName, String mimeType) {
             try {
-                String cleanB64 = base64Data;
-                if (cleanB64 != null && cleanB64.contains(",")) {
-                    cleanB64 = cleanB64.substring(cleanB64.indexOf(",") + 1);
-                }
-                byte[] bytes = Base64.decode(cleanB64, Base64.DEFAULT);
-                File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-                File targetDir = baseDir;
-                if (folderName != null && !folderName.trim().isEmpty()) {
-                    String safeFolder = folderName.trim().replace("..", "").replace('/', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('<', '_').replace('>', '_').replace('|', '_');
-                    targetDir = new File(baseDir, safeFolder);
-                }
-                if (!targetDir.exists()) targetDir.mkdirs();
-                File outFile = new File(targetDir, fileName);
-                FileOutputStream fos = new FileOutputStream(outFile);
-                fos.write(bytes);
-                fos.flush();
-                fos.close();
-                final String msg = (folderName != null && !folderName.trim().isEmpty())
-                    ? ("تم حفظ الملف في Download/" + folderName.trim() + "/" + fileName)
-                    : ("تم حفظ الملف في التنزيلات: " + fileName);
-                activity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        Toast.makeText(activity, msg, Toast.LENGTH_LONG).show();
-                    }
-                });
+                String sId = beginSaveFile(fileName);
+                if (sId == null || sId.isEmpty()) return false;
+                if (!appendSaveFileChunk(sId, base64Data)) return false;
+                String res = finishSaveFile(sId, fileName, mimeType, folderName);
+                return res != null && res.startsWith("OK:");
             } catch (final Exception e) {
                 activity.runOnUiThread(new Runnable() {
                     @Override
@@ -2827,6 +3058,7 @@ public class MainActivity extends Activity {
                         Toast.makeText(activity, "خطأ أثناء حفظ الملف: " + e.getMessage(), Toast.LENGTH_LONG).show();
                     }
                 });
+                return false;
             }
         }
 
