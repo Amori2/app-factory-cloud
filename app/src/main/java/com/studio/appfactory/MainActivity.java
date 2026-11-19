@@ -13,27 +13,24 @@ import android.content.ClipboardManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
-import android.graphics.Bitmap;
-import android.media.MediaScannerConnection;
-import android.net.wifi.WifiManager;
-import android.os.PowerManager;
-import android.provider.MediaStore;
-import org.json.JSONArray;
-import java.io.FileInputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import org.json.JSONObject;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaScannerConnection;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Message;
+import android.os.PowerManager;
+import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -53,7 +50,6 @@ import android.webkit.PermissionRequest;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
-import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
@@ -63,16 +59,28 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+
 
 public class MainActivity extends Activity {
     private FrameLayout rootLayout;
@@ -87,27 +95,54 @@ public class MainActivity extends Activity {
 
     private PowerManager.WakeLock downloadWakeLock;
     private WifiManager.WifiLock downloadWifiLock;
-    private final Map<String, NativeHlsJob> nativeHlsJobs = new HashMap<String, NativeHlsJob>();
-    private final Map<String, File> activeSaveTempFiles = new HashMap<String, File>();
 
-    public static class NativeHlsJob {
+    // Embedded yt-dlp + FFmpeg readiness flags
+    private volatile boolean ytdlpReady = false;
+    private volatile boolean ytdlpInitializing = false;
+    private volatile String ytdlpInitError = "";
+
+    // Unified Strict FIFO Native Download Queue (HLS + yt-dlp + Direct HTTP)
+    private final Object queueLock = new Object();
+    private final List<String> nativeQueueOrder = new ArrayList<String>();
+    private final Map<String, NativeDownloadJob> nativeJobsById = new HashMap<String, NativeDownloadJob>();
+    private volatile int nativeMaxConcurrent = 1;
+    private volatile int nativeActiveWorkers = 0;
+
+    private final Map<String, File> activeSaveTempFiles = new HashMap<String, File>();
+    private final Map<String, FileOutputStream> activeSaveStreams = new HashMap<String, FileOutputStream>();
+
+    public static class NativeDownloadJob {
+        public static final int TYPE_HLS = 1;
+        public static final int TYPE_YTDLP = 2;
+        public static final int TYPE_DIRECT = 3;
+
         public String jobId;
+        public int type = TYPE_HLS;
         public String[] segmentUrls;
         public String initMapUrl;
+        public String sourceUrl;
+        public String formatSelector;
+        public boolean isAudioOnly = false;
+        public String mimeType = "video/mp4";
         public String fileName;
         public String subFolder;
         public String refererUrl;
-        public int totalSegments;
+        public int totalSegments = 0;
         public volatile int currentSegmentIndex = 0;
         public volatile long downloadedBytes = 0;
+        public volatile long totalBytes = 0;
+        public volatile int lastPercent = 0;
         public volatile boolean initDownloaded = false;
         public volatile boolean isFmp4 = false;
         public volatile boolean running = false;
+        public volatile boolean queued = false;
         public volatile boolean paused = false;
         public volatile boolean canceled = false;
+        public volatile boolean completed = false;
         public File tempFile;
+        public File tempWorkDir;
     }
-    private final Map<String, FileOutputStream> activeSaveStreams = new HashMap<String, FileOutputStream>();
+
     private volatile boolean nativeAdBlockEnabled = true;
     private volatile String currentBrowserUrl = "";
     private volatile String currentBrowserTitle = "";
@@ -130,6 +165,25 @@ public class MainActivity extends Activity {
 
     private int dpToPx(int dp) {
         return Math.round(dp * getResources().getDisplayMetrics().density);
+    }
+
+    private boolean isNetworkAvailable() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            NetworkInfo ni = cm.getActiveNetworkInfo();
+            return ni != null && ni.isConnected();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private void initEmbeddedYtdlpAsync() {
+        
+    }
+
+    private boolean waitForYtdlpReady(int maxSeconds) {
+        return false;
     }
 
     private boolean isNativeAdOrTrackerUrl(String rawUrl) {
@@ -163,7 +217,6 @@ public class MainActivity extends Activity {
         String pathOnly = qIdx >= 0 ? lower.substring(0, qIdx) : lower;
         int hIdx = pathOnly.indexOf('#');
         if (hIdx >= 0) pathOnly = pathOnly.substring(0, hIdx);
-        // Ignore individual HLS/DASH segment chunks (.ts, .m4s) and non-media assets
         if (pathOnly.endsWith(".ts") || pathOnly.endsWith(".m4s") || pathOnly.endsWith(".aac") ||
             pathOnly.endsWith(".vtt") || pathOnly.endsWith(".srt") || pathOnly.endsWith(".jpg") ||
             pathOnly.endsWith(".jpeg") || pathOnly.endsWith(".png") || pathOnly.endsWith(".gif") ||
@@ -287,14 +340,14 @@ public class MainActivity extends Activity {
             "var q=e.getAttribute('label')||e.getAttribute('res')||e.getAttribute('size')||'';" +
             "window.AndroidBridge.reportDetectedMediaFromJs(u,pt,q);" +
             "}}" +
-            "if(!window._snapLpBound){window._snapLpBound=true;" +
+            "if(!window._cruzLpBound){window._cruzLpBound=true;" +
             "document.addEventListener('contextmenu',function(ev){try{" +
             "var t=ev.target;if(!t||!t.closest)return;" +
             "var vid=t.closest('video,audio');" +
             "var lnk=t.closest('a[href]');" +
             "var targetUrl='';var labelTxt='';" +
-            "if(vid){targetUrl=vid.currentSrc||vid.src||vid.getAttribute('src')||location.href;labelTxt=document.title||'Video';}" +
-            "else if(lnk){var h=lnk.getAttribute('href')||'';if(h&&h.charAt(0)!=='#'&&h.indexOf('javascript:')!==0){targetUrl=new URL(h,location.href).href;labelTxt=(lnk.textContent||lnk.title||document.title||'').trim();}}" +
+            "if(lnk){var h=lnk.getAttribute('href')||'';if(h&&h.charAt(0)!=='#'&&h.indexOf('javascript:')!==0){targetUrl=new URL(h,location.href).href;labelTxt=(lnk.getAttribute('title')||lnk.getAttribute('aria-label')||lnk.innerText||lnk.textContent||'').trim();if(labelTxt.length>90)labelTxt=labelTxt.substring(0,90);}}" +
+            "else if(vid){targetUrl=vid.currentSrc||vid.src||vid.getAttribute('src')||location.href;labelTxt='';}" +
             "if(targetUrl&&window.AndroidBridge&&window.AndroidBridge.onLongPressPageElement){ev.preventDefault();window.AndroidBridge.onLongPressPageElement(targetUrl,labelTxt);}" +
             "}catch(ex){}},true);}" +
             "}catch(err){}})();";
@@ -305,6 +358,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        System.setProperty("http.keepAlive", "true");
+        System.setProperty("http.maxConnections", "8");
+
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         
         
@@ -315,11 +371,12 @@ public class MainActivity extends Activity {
         try { getWindow().getDecorView().setBackgroundColor(Color.parseColor(initBgHex)); } catch (Exception ignored) {}
 
         requestNeededPermissions();
+        initEmbeddedYtdlpAsync();
 
         rootLayout = new FrameLayout(this);
         rootLayout.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // 1. Primary App UI WebView (overrides onWindowVisibilityChanged so background downloads NEVER pause when switching apps!)
+        // 1. Primary App UI WebView
         webView = new WebView(this) {
             @Override
             protected void onWindowVisibilityChanged(int visibility) {
@@ -331,14 +388,14 @@ public class MainActivity extends Activity {
         webView.setFocusableInTouchMode(true);
         rootLayout.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // 2. Real Top-Level Browser WebView for Websites (Zero iframe / Zero ERR_BLOCKED_BY_RESPONSE!)
+        // 2. Real Top-Level Browser WebView for Websites
         browserWebView = new WebView(this);
         browserWebView.setBackgroundColor(Color.WHITE);
         browserWebView.setFocusable(true);
         browserWebView.setFocusableInTouchMode(true);
         FrameLayout.LayoutParams browserParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-        browserParams.topMargin = dpToPx(92);
-        browserParams.bottomMargin = dpToPx(56);
+        browserParams.topMargin = dpToPx(106);
+        browserParams.bottomMargin = dpToPx(58);
         browserWebView.setLayoutParams(browserParams);
         browserWebView.setVisibility(View.GONE);
         browserWebView.setOnLongClickListener(new View.OnLongClickListener() {
@@ -353,7 +410,8 @@ public class MainActivity extends Activity {
                     if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
                         type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE ||
                         type == WebView.HitTestResult.IMAGE_TYPE) {
-                        showLongPressLinkDialog(extra, currentBrowserTitle);
+                        // NEVER pass currentBrowserTitle here so background tabs do NOT inherit the current tab's name!
+                        showLongPressLinkDialog(extra, "");
                         return true;
                     }
                 }
@@ -362,11 +420,11 @@ public class MainActivity extends Activity {
         });
         rootLayout.addView(browserWebView);
 
-        // 3. Native Floating Download Button on top of Browser WebView when media is detected
+        // 3. Native Floating Download Button on top of Browser WebView
         nativeFabBtn = new TextView(this);
         nativeFabBtn.setText("⬇ 1");
         nativeFabBtn.setTextColor(Color.parseColor("#111827"));
-        nativeFabBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        nativeFabBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         nativeFabBtn.setGravity(Gravity.CENTER);
         GradientDrawable fabBg = new GradientDrawable();
         fabBg.setShape(GradientDrawable.OVAL);
@@ -376,9 +434,9 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             nativeFabBtn.setElevation(dpToPx(8));
         }
-        FrameLayout.LayoutParams fabParams = new FrameLayout.LayoutParams(dpToPx(48), dpToPx(48));
+        FrameLayout.LayoutParams fabParams = new FrameLayout.LayoutParams(dpToPx(52), dpToPx(52));
         fabParams.gravity = Gravity.BOTTOM | Gravity.LEFT;
-        fabParams.bottomMargin = dpToPx(68);
+        fabParams.bottomMargin = dpToPx(70);
         fabParams.leftMargin = dpToPx(14);
         nativeFabBtn.setLayoutParams(fabParams);
         nativeFabBtn.setVisibility(View.GONE);
@@ -416,7 +474,6 @@ public class MainActivity extends Activity {
         browserWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         browserWebView.addJavascriptInterface(bridge, "AndroidBridge");
 
-        // Setup Primary UI WebViewClient
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
@@ -432,7 +489,6 @@ public class MainActivity extends Activity {
                 }
                 return super.shouldInterceptRequest(view, request);
             }
-
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -460,12 +516,10 @@ public class MainActivity extends Activity {
                     url.startsWith("https://")) {
                     return false;
                 }
-                // Block non-http external schemes (like intent:// ad redirects) from auto-opening system browser!
                 return true;
             }
         });
 
-        // Setup Native Browser WebViewClient (1DM-style Network Sniffer + Ad Blocker + Zero External Redirects)
         browserWebView.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
@@ -481,7 +535,6 @@ public class MainActivity extends Activity {
                 }
                 return super.shouldInterceptRequest(view, request);
             }
-
             @Override
             public void onLoadResource(WebView view, String url) {
                 super.onLoadResource(view, url);
@@ -489,7 +542,6 @@ public class MainActivity extends Activity {
                     notifyUiMediaDetected(url, currentBrowserTitle, "");
                 }
             }
-
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && request != null && request.getUrl() != null) {
@@ -497,19 +549,13 @@ public class MainActivity extends Activity {
                 }
                 return false;
             }
-
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
                 return handleBrowserUri(view, url);
             }
-
             private boolean handleBrowserUri(WebView view, String url) {
                 if (url == null) return true;
-                if (isNativeAdOrTrackerUrl(url)) {
-                    notifyUiAdBlocked();
-                    return true;
-                }
-                if (url.startsWith("intent://") || url.startsWith("market://")) {
+                if (isNativeAdOrTrackerUrl(url) || url.startsWith("intent://") || url.startsWith("market://")) {
                     notifyUiAdBlocked();
                     return true;
                 }
@@ -530,10 +576,8 @@ public class MainActivity extends Activity {
                     notifyUiBrowserState(url, currentBrowserTitle);
                     return true;
                 }
-                // Block any non-http scheme from escaping to the system browser
                 return true;
             }
-
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
@@ -553,7 +597,6 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
@@ -578,7 +621,6 @@ public class MainActivity extends Activity {
                     notifyUiBrowserState(currentBrowserUrl, currentBrowserTitle);
                 }
             }
-
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
                 if (resultMsg == null) return false;
@@ -615,7 +657,6 @@ public class MainActivity extends Activity {
                 resultMsg.sendToTarget();
                 return true;
             }
-
             @Override
             public boolean onJsAlert(WebView view, String url, String message, final JsResult result) {
                 if (isFinishing()) { result.cancel(); return true; }
@@ -629,7 +670,6 @@ public class MainActivity extends Activity {
                     }).show();
                 return true;
             }
-
             @Override
             public boolean onJsConfirm(WebView view, String url, String message, final JsResult result) {
                 if (isFinishing()) { result.cancel(); return true; }
@@ -646,7 +686,6 @@ public class MainActivity extends Activity {
                     }).show();
                 return true;
             }
-
             @Override
             public boolean onJsPrompt(WebView view, String url, String message, String defaultValue, final JsPromptResult result) {
                 if (isFinishing()) { result.cancel(); return true; }
@@ -666,22 +705,18 @@ public class MainActivity extends Activity {
                     }).show();
                 return true;
             }
-
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     request.grant(request.getResources());
                 }
             }
-
             @Override
             public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
                 callback.invoke(origin, true, false);
             }
-
             @Override
             public boolean onConsoleMessage(ConsoleMessage cm) { return true; }
-
             @Override
             public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
                 if (MainActivity.this.filePathCallback != null) {
@@ -692,28 +727,8 @@ public class MainActivity extends Activity {
                     Intent i = new Intent(Intent.ACTION_GET_CONTENT);
                     i.addCategory(Intent.CATEGORY_OPENABLE);
                     i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                    String mimeType = "*/*";
-                    if (fileChooserParams != null && fileChooserParams.getAcceptTypes() != null) {
-                        String[] types = fileChooserParams.getAcceptTypes();
-                        boolean wantsImagesOnly = false;
-                        boolean wantsPdfOnly = false;
-                        for (String t : types) {
-                            if (t == null) continue;
-                            String clean = t.trim().toLowerCase();
-                            if (clean.startsWith("image/") || clean.contains(".png") || clean.contains(".jpg") || clean.contains(".jpeg")) {
-                                wantsImagesOnly = true;
-                            } else if (clean.equals("application/pdf") || clean.equals(".pdf")) {
-                                wantsPdfOnly = true;
-                            }
-                        }
-                        if (wantsImagesOnly && !wantsPdfOnly) {
-                            mimeType = "image/*";
-                        } else if (wantsPdfOnly && !wantsImagesOnly) {
-                            mimeType = "application/pdf";
-                        }
-                    }
-                    i.setType(mimeType);
-                    startActivityForResult(Intent.createChooser(i, "اختر الملفات أو الصور (يدعم التحديد المتعدد)"), FILE_CHOOSER_CODE);
+                    i.setType("*/*");
+                    startActivityForResult(Intent.createChooser(i, "اختر الملفات"), FILE_CHOOSER_CODE);
                 } catch (Exception e) {
                     MainActivity.this.filePathCallback = null;
                     return false;
@@ -837,11 +852,12 @@ public class MainActivity extends Activity {
                 final String[] options = new String[]{
                     "فتح في تبويب بالخلفية (Open in background tab)",
                     "فتح في تبويب جديد الآن (Open in new tab)",
-                    "فحص وتحميل الفيديو من الرابط",
+                    "استخراج وتحميل الفيديو من الرابط (yt-dlp)",
                     "نسخ الرابط (Copy link)"
                 };
+                String dialogTitle = (labelTitle != null && !labelTitle.trim().isEmpty()) ? labelTitle.trim() : targetUrl;
                 AlertDialog.Builder builder = new AlertDialog.Builder(MainActivity.this);
-                builder.setTitle(labelTitle != null && !labelTitle.isEmpty() ? labelTitle : targetUrl);
+                builder.setTitle(dialogTitle);
                 builder.setItems(options, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
@@ -856,18 +872,11 @@ public class MainActivity extends Activity {
                         } else if (which == 1) {
                             notifyUiNewInternalTab(targetUrl);
                         } else if (which == 2) {
-                            if (isSniffableMediaUrl(targetUrl)) {
-                                notifyUiMediaDetected(targetUrl, labelTitle, "");
-                            } else if (webView != null) {
-                                String js = "if(window.openUrlInBackgroundTab)window.openUrlInBackgroundTab(" +
-                                    JSONObject.quote(targetUrl) + "," +
-                                    JSONObject.quote(labelTitle != null ? labelTitle : "") + ",true);";
-                                webView.evaluateJavascript(js, null);
-                            }
                             browserWebView.setVisibility(View.GONE);
                             nativeFabBtn.setVisibility(View.GONE);
                             if (webView != null) {
-                                webView.evaluateJavascript("if(window.openDetectedMediaSheet)window.openDetectedMediaSheet();", null);
+                                String js = "if(window.extractUrlWithNativeYtdlp)window.extractUrlWithNativeYtdlp(" + JSONObject.quote(targetUrl) + ");";
+                                webView.evaluateJavascript(js, null);
                             }
                         } else if (which == 3) {
                             try {
@@ -899,17 +908,17 @@ public class MainActivity extends Activity {
                 if (downloadWakeLock == null) {
                     PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                     if (pm != null) {
-                        downloadWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Snap1DM:BgDownloadLock");
+                        downloadWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CruzDM:BgDownloadLock");
                         downloadWakeLock.setReferenceCounted(false);
                     }
                 }
                 if (downloadWakeLock != null && !downloadWakeLock.isHeld()) {
-                    downloadWakeLock.acquire(4 * 60 * 60 * 1000L);
+                    downloadWakeLock.acquire(8 * 60 * 60 * 1000L);
                 }
                 if (downloadWifiLock == null) {
                     WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
                     if (wm != null) {
-                        downloadWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Snap1DM:BgWifiLock");
+                        downloadWifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "CruzDM:BgWifiLock");
                         downloadWifiLock.setReferenceCounted(false);
                     }
                 }
@@ -917,13 +926,11 @@ public class MainActivity extends Activity {
                     downloadWifiLock.acquire();
                 }
             } else {
-                boolean anyRunning = false;
-                synchronized (nativeHlsJobs) {
-                    for (NativeHlsJob j : nativeHlsJobs.values()) {
-                        if (j.running) { anyRunning = true; break; }
-                    }
+                boolean anyActive;
+                synchronized (queueLock) {
+                    anyActive = nativeActiveWorkers > 0 || !nativeQueueOrder.isEmpty();
                 }
-                if (!anyRunning) {
+                if (!anyActive) {
                     try { stopService(new Intent(this, DownloadKeepAliveService.class)); } catch (Exception ignored) {}
                     if (downloadWakeLock != null && downloadWakeLock.isHeld()) {
                         downloadWakeLock.release();
@@ -936,7 +943,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
-    private void emitNativeHlsProgressToUi(final String jobId, final int doneSegs, final int totalSegs, final long bytes, final long speedBps, final String status, final String savedResult) {
+    private void emitNativeJobProgressToUi(final String jobId, final int doneSegs, final int totalSegs, final long bytes, final long totalBytes, final long speedBps, final int percent, final String status, final String savedResult) {
         if (webView == null) return;
         runOnUiThread(new Runnable() {
             @Override
@@ -949,25 +956,92 @@ public class MainActivity extends Activity {
                         bytes + "," +
                         speedBps + "," +
                         JSONObject.quote(status != null ? status : "") + "," +
-                        JSONObject.quote(savedResult != null ? savedResult : "") + ");";
+                        JSONObject.quote(savedResult != null ? savedResult : "") + "," +
+                        percent + "," +
+                        totalBytes + ");";
                     webView.evaluateJavascript(js, null);
                 } catch (Exception ignored) {}
             }
         });
     }
 
-    private byte[] downloadSegmentBytesWithRetry(String segUrl, String refererUrl) throws Exception {
+    private void dispatchNextQueuedNativeJob() {
+        while (true) {
+            final NativeDownloadJob nextJob;
+            synchronized (queueLock) {
+                if (nativeActiveWorkers >= Math.max(1, nativeMaxConcurrent)) {
+                    return;
+                }
+                NativeDownloadJob picked = null;
+                Iterator<String> it = nativeQueueOrder.iterator();
+                while (it.hasNext()) {
+                    String jid = it.next();
+                    NativeDownloadJob cand = nativeJobsById.get(jid);
+                    if (cand == null || cand.canceled || cand.completed) {
+                        it.remove();
+                        continue;
+                    }
+                    if (cand.paused || cand.running) {
+                        continue;
+                    }
+                    it.remove();
+                    cand.queued = false;
+                    cand.running = true;
+                    nativeActiveWorkers++;
+                    picked = cand;
+                    break;
+                }
+                nextJob = picked;
+            }
+            if (nextJob == null) {
+                setDownloadWakeLock(false);
+                return;
+            }
+            setDownloadWakeLock(true);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (nextJob.type == NativeDownloadJob.TYPE_YTDLP) {
+                            runYtdlpJobSync(nextJob);
+                        } else if (nextJob.type == NativeDownloadJob.TYPE_DIRECT) {
+                            runDirectHttpJobSync(nextJob);
+                        } else {
+                            runHlsJobSync(nextJob);
+                        }
+                    } finally {
+                        synchronized (queueLock) {
+                            nextJob.running = false;
+                            if (nativeActiveWorkers > 0) nativeActiveWorkers--;
+                        }
+                        dispatchNextQueuedNativeJob();
+                    }
+                }
+            }).start();
+        }
+    }
+
+    private byte[] downloadSegmentBytesWithRetry(String segUrl, String refererUrl, NativeDownloadJob job) throws Exception {
         Exception lastErr = null;
-        for (int attempt = 0; attempt <= 3; attempt++) {
+        for (int attempt = 0; attempt <= 6; attempt++) {
+            if (job.paused || job.canceled || !job.running) throw new Exception("Paused");
+            // Wait automatically if network temporarily drops instead of disconnecting/failing!
+            int offlineWait = 0;
+            while (!isNetworkAvailable() && offlineWait < 60 && !job.paused && !job.canceled && job.running) {
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Waiting", "بانتظار عودة الإنترنت...");
+                try { Thread.sleep(2000); } catch (Exception ignored) {}
+                offlineWait++;
+            }
             HttpURLConnection conn = null;
             InputStream is = null;
             try {
                 URL u = new URL(segUrl);
                 conn = (HttpURLConnection) u.openConnection();
-                conn.setConnectTimeout(25000);
-                conn.setReadTimeout(35000);
+                conn.setConnectTimeout(30000);
+                conn.setReadTimeout(60000);
                 conn.setInstanceFollowRedirects(true);
                 conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
+                conn.setRequestProperty("Connection", "keep-alive");
                 if (refererUrl != null && !refererUrl.isEmpty()) {
                     conn.setRequestProperty("Referer", refererUrl);
                 }
@@ -980,18 +1054,21 @@ public class MainActivity extends Activity {
                     throw new Exception("HTTP " + code);
                 }
                 is = conn.getInputStream();
-                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                byte[] buf = new byte[32768];
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buf = new byte[65536];
                 int r;
                 while ((r = is.read(buf)) != -1) {
+                    if (job.paused || job.canceled || !job.running) throw new Exception("Paused");
                     baos.write(buf, 0, r);
                 }
                 byte[] data = baos.toByteArray();
                 if (data.length == 0) throw new Exception("Empty segment");
                 return data;
             } catch (Exception e) {
+                if (job.paused || job.canceled || !job.running) throw e;
                 lastErr = e;
-                try { Thread.sleep(1200L * (attempt + 1)); } catch (Exception ignored) {}
+                long backoff = Math.min(8000L, 1000L * (attempt + 1));
+                try { Thread.sleep(backoff); } catch (Exception ignored) {}
             } finally {
                 try { if (is != null) is.close(); } catch (Exception ignored) {}
                 if (conn != null) conn.disconnect();
@@ -1000,108 +1077,266 @@ public class MainActivity extends Activity {
         throw (lastErr != null ? lastErr : new Exception("Segment failed"));
     }
 
-    public void startOrResumeNativeHlsWorker(final NativeHlsJob job) {
-        if (job == null || job.running) return;
-        job.running = true;
-        job.paused = false;
-        job.canceled = false;
-        setDownloadWakeLock(true);
+    private void runHlsJobSync(NativeDownloadJob job) {
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(job.tempFile, true);
+            if (job.initMapUrl != null && !job.initMapUrl.isEmpty() && !job.initDownloaded && job.currentSegmentIndex == 0) {
+                byte[] initBytes = downloadSegmentBytesWithRetry(job.initMapUrl, job.refererUrl, job);
+                fos.write(initBytes);
+                fos.flush();
+                job.downloadedBytes += initBytes.length;
+                job.initDownloaded = true;
+                job.isFmp4 = true;
+            }
 
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                FileOutputStream fos = null;
-                try {
-                    fos = new FileOutputStream(job.tempFile, true);
-                    if (job.initMapUrl != null && !job.initMapUrl.isEmpty() && !job.initDownloaded && job.currentSegmentIndex == 0) {
-                        byte[] initBytes = downloadSegmentBytesWithRetry(job.initMapUrl, job.refererUrl);
-                        fos.write(initBytes);
-                        fos.flush();
-                        job.downloadedBytes += initBytes.length;
-                        job.initDownloaded = true;
+            long lastTickTime = System.currentTimeMillis();
+            long bytesAtLastTick = job.downloadedBytes;
+            double ewmaSpeed = 0.0;
+
+            for (int i = job.currentSegmentIndex; i < job.totalSegments; i++) {
+                if (!job.running || job.paused || job.canceled) break;
+                byte[] segBytes = downloadSegmentBytesWithRetry(job.segmentUrls[i], job.refererUrl, job);
+                if (!job.running || job.paused || job.canceled) break;
+                if (i == 0 && !job.isFmp4 && segBytes.length >= 8) {
+                    String box = new String(segBytes, 4, 4, "ISO-8859-1");
+                    if ("ftyp".equals(box) || "styp".equals(box) || "moof".equals(box) || "sidx".equals(box)) {
                         job.isFmp4 = true;
                     }
+                }
+                fos.write(segBytes);
+                fos.flush();
+                job.downloadedBytes += segBytes.length;
+                job.currentSegmentIndex = i + 1;
 
-                    long lastTickTime = System.currentTimeMillis();
-                    long bytesAtLastTick = job.downloadedBytes;
-                    long currentSpeed = 0;
+                long now = System.currentTimeMillis();
+                if (now - lastTickTime >= 600) {
+                    double instSpeed = ((job.downloadedBytes - bytesAtLastTick) * 1000.0) / Math.max(1L, now - lastTickTime);
+                    ewmaSpeed = ewmaSpeed <= 0.1 ? instSpeed : (ewmaSpeed * 0.65 + instSpeed * 0.35);
+                    lastTickTime = now;
+                    bytesAtLastTick = job.downloadedBytes;
+                }
 
-                    for (int i = job.currentSegmentIndex; i < job.totalSegments; i++) {
-                        if (!job.running || job.paused || job.canceled) {
-                            break;
-                        }
-                        byte[] segBytes = downloadSegmentBytesWithRetry(job.segmentUrls[i], job.refererUrl);
-                        if (!job.running || job.paused || job.canceled) {
-                            break;
-                        }
-                        if (i == 0 && !job.isFmp4 && segBytes.length >= 8) {
-                            String box = new String(segBytes, 4, 4, "ISO-8859-1");
-                            if ("ftyp".equals(box) || "styp".equals(box) || "moof".equals(box) || "sidx".equals(box)) {
-                                job.isFmp4 = true;
-                            }
-                        }
-                        fos.write(segBytes);
-                        fos.flush();
-                        job.downloadedBytes += segBytes.length;
-                        job.currentSegmentIndex = i + 1;
+                int pct = (job.currentSegmentIndex * 100) / Math.max(1, job.totalSegments);
+                job.lastPercent = pct;
+                long estTotal = job.currentSegmentIndex > 0 ? ((job.downloadedBytes * job.totalSegments) / job.currentSegmentIndex) : 0;
+                job.totalBytes = estTotal;
+                showOrUpdateLockScreenTimer("CruzDM • جاري التحميل (" + pct + "%)", job.currentSegmentIndex + "/" + job.totalSegments, job.fileName, true);
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, estTotal, (long) ewmaSpeed, pct, "Downloading", "");
+            }
 
-                        long now = System.currentTimeMillis();
-                        if (now - lastTickTime >= 500) {
-                            currentSpeed = ((job.downloadedBytes - bytesAtLastTick) * 1000L) / Math.max(1L, now - lastTickTime);
-                            lastTickTime = now;
-                            bytesAtLastTick = job.downloadedBytes;
-                        }
+            fos.flush();
+            fos.close();
+            fos = null;
 
-                        int pct = (job.currentSegmentIndex * 100) / Math.max(1, job.totalSegments);
-                        showOrUpdateLockScreenTimer("جاري التحميل (" + pct + "%)", job.currentSegmentIndex + "/" + job.totalSegments, job.fileName, true);
-                        emitNativeHlsProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, currentSpeed, "Downloading", "");
+            if (job.canceled) {
+                try { job.tempFile.delete(); } catch (Exception ignored) {}
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Canceled", "");
+            } else if (job.paused || !job.running) {
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+            } else if (job.currentSegmentIndex >= job.totalSegments) {
+                job.completed = true;
+                emitNativeJobProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, job.downloadedBytes, 0, 100, "Saving", "");
+                String finalName = job.fileName;
+                String finalMime = job.isFmp4 ? "video/mp4" : "video/mp2t";
+                if (job.isFmp4 && finalName.endsWith(".ts")) {
+                    finalName = finalName.substring(0, finalName.length() - 3) + ".mp4";
+                }
+                final String savedRes = moveTempFileToPublicDownloads(job.tempFile, finalName, finalMime, job.subFolder);
+                showOrUpdateLockScreenTimer("", "00:00", "", false);
+                if (savedRes.startsWith("OK:")) {
+                    final String toastName = finalName;
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() { Toast.makeText(MainActivity.this, "CruzDM: تم حفظ " + toastName, Toast.LENGTH_SHORT).show(); }
+                    });
+                    emitNativeJobProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, job.downloadedBytes, 0, 100, "Completed", savedRes);
+                } else {
+                    emitNativeJobProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, job.downloadedBytes, 0, 100, "SaveFailed", savedRes);
+                }
+            }
+        } catch (Exception e) {
+            if (!job.paused && !job.canceled) {
+                job.paused = true;
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Failed", e.getMessage());
+            } else if (job.paused) {
+                emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+            }
+        } finally {
+            try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void runDirectHttpJobSync(NativeDownloadJob job) {
+        FileOutputStream fos = null;
+        InputStream is = null;
+        HttpURLConnection conn = null;
+        try {
+            long existingBytes = (job.tempFile != null && job.tempFile.exists()) ? job.tempFile.length() : 0;
+            job.downloadedBytes = existingBytes;
+            int retries = 0;
+            double ewmaSpeed = 0.0;
+
+            while (retries <= 6 && !job.paused && !job.canceled && job.running) {
+                int offlineWait = 0;
+                while (!isNetworkAvailable() && offlineWait < 60 && !job.paused && !job.canceled && job.running) {
+                    emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Waiting", "بانتظار عودة الإنترنت...");
+                    try { Thread.sleep(2000); } catch (Exception ignored) {}
+                    offlineWait++;
+                }
+                try {
+                    URL u = new URL(job.sourceUrl);
+                    conn = (HttpURLConnection) u.openConnection();
+                    conn.setConnectTimeout(30000);
+                    conn.setReadTimeout(60000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
+                    conn.setRequestProperty("Connection", "keep-alive");
+                    if (job.refererUrl != null && !job.refererUrl.isEmpty()) {
+                        conn.setRequestProperty("Referer", job.refererUrl);
+                    }
+                    String cookies = CookieManager.getInstance().getCookie(job.sourceUrl);
+                    if (cookies != null && !cookies.isEmpty()) {
+                        conn.setRequestProperty("Cookie", cookies);
+                    }
+                    if (existingBytes > 0) {
+                        conn.setRequestProperty("Range", "bytes=" + existingBytes + "-");
+                    }
+                    int code = conn.getResponseCode();
+                    boolean appendMode = (code == 206 && existingBytes > 0);
+                    if (!appendMode && (code < 200 || code >= 300)) {
+                        throw new Exception("HTTP " + code);
+                    }
+                    long contentLen = conn.getContentLengthLong();
+                    if (contentLen > 0) {
+                        job.totalBytes = appendMode ? (existingBytes + contentLen) : contentLen;
+                    }
+                    if (!appendMode) {
+                        existingBytes = 0;
+                        job.downloadedBytes = 0;
                     }
 
+                    fos = new FileOutputStream(job.tempFile, appendMode);
+                    is = conn.getInputStream();
+                    byte[] buf = new byte[65536];
+                    int r;
+                    long lastTick = System.currentTimeMillis();
+                    long bytesAtTick = job.downloadedBytes;
+
+                    while ((r = is.read(buf)) != -1) {
+                        if (job.paused || job.canceled || !job.running) break;
+                        fos.write(buf, 0, r);
+                        job.downloadedBytes += r;
+                        existingBytes = job.downloadedBytes;
+
+                        long now = System.currentTimeMillis();
+                        if (now - lastTick >= 600) {
+                            double inst = ((job.downloadedBytes - bytesAtTick) * 1000.0) / Math.max(1L, now - lastTick);
+                            ewmaSpeed = ewmaSpeed <= 0.1 ? inst : (ewmaSpeed * 0.65 + inst * 0.35);
+                            lastTick = now;
+                            bytesAtTick = job.downloadedBytes;
+                            int pct = job.totalBytes > 0 ? (int) Math.min(99L, (job.downloadedBytes * 100L) / job.totalBytes) : 50;
+                            job.lastPercent = pct;
+                            showOrUpdateLockScreenTimer("CruzDM • جاري التحميل (" + pct + "%)", pct + "%", job.fileName, true);
+                            emitNativeJobProgressToUi(job.jobId, pct, 100, job.downloadedBytes, job.totalBytes, (long) ewmaSpeed, pct, "Downloading", "");
+                        }
+                    }
                     fos.flush();
                     fos.close();
                     fos = null;
-
-                    if (job.canceled) {
-                        try { job.tempFile.delete(); } catch (Exception ignored) {}
-                        emitNativeHlsProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, 0, "Canceled", "");
-                    } else if (job.paused || !job.running) {
-                        emitNativeHlsProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, 0, "Paused", "");
-                    } else if (job.currentSegmentIndex >= job.totalSegments) {
-                        job.running = false;
-                        emitNativeHlsProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, 0, "Saving", "");
-                        String finalName = job.fileName;
-                        String finalMime = job.isFmp4 ? "video/mp4" : "video/mp2t";
-                        if (job.isFmp4 && finalName.endsWith(".ts")) {
-                            finalName = finalName.substring(0, finalName.length() - 3) + ".mp4";
-                        } else if (!job.isFmp4 && finalName.endsWith(".mp4")) {
-                            // Keep .mp4 if user player prefers or .ts based on container
-                        }
-                        final String savedRes = moveTempFileToPublicDownloads(job.tempFile, finalName, finalMime, job.subFolder);
-                        showOrUpdateLockScreenTimer("", "00:00", "", false);
-                        if (savedRes.startsWith("OK:")) {
-                            final String toastName = finalName;
-                            runOnUiThread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    Toast.makeText(MainActivity.this, "اكتمل التحميل والحفظ: " + toastName, Toast.LENGTH_LONG).show();
-                                }
-                            });
-                            emitNativeHlsProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, 0, "Completed", savedRes);
-                        } else {
-                            emitNativeHlsProgressToUi(job.jobId, job.totalSegments, job.totalSegments, job.downloadedBytes, 0, "SaveFailed", savedRes);
-                        }
-                    }
-                } catch (Exception e) {
-                    job.running = false;
-                    job.paused = true;
-                    emitNativeHlsProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, 0, "Failed", e.getMessage());
-                } finally {
+                    is.close();
+                    is = null;
+                    conn.disconnect();
+                    conn = null;
+                    break;
+                } catch (Exception netErr) {
                     try { if (fos != null) fos.close(); } catch (Exception ignored) {}
-                    job.running = false;
-                    setDownloadWakeLock(false);
+                    try { if (is != null) is.close(); } catch (Exception ignored) {}
+                    if (conn != null) conn.disconnect();
+                    fos = null; is = null; conn = null;
+                    retries++;
+                    if (retries > 6 || job.paused || job.canceled) throw netErr;
+                    try { Thread.sleep(1500L * retries); } catch (Exception ignored) {}
                 }
             }
-        }).start();
+
+            if (job.canceled) {
+                try { job.tempFile.delete(); } catch (Exception ignored) {}
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Canceled", "");
+            } else if (job.paused || !job.running) {
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+            } else {
+                job.completed = true;
+                emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.downloadedBytes, 0, 100, "Saving", "");
+                String savedRes = moveTempFileToPublicDownloads(job.tempFile, job.fileName, job.mimeType, job.subFolder);
+                showOrUpdateLockScreenTimer("", "00:00", "", false);
+                if (savedRes.startsWith("OK:")) {
+                    emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.downloadedBytes, 0, 100, "Completed", savedRes);
+                } else {
+                    emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.downloadedBytes, 0, 100, "SaveFailed", savedRes);
+                }
+            }
+        } catch (Exception e) {
+            job.paused = true;
+            emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Failed", e.getMessage());
+        } finally {
+            try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+            try { if (is != null) is.close(); } catch (Exception ignored) {}
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private void runYtdlpJobSync(final NativeDownloadJob job) {
+        emitNativeJobProgressToUi(job.jobId, 0, 100, 0, 0, 0, 0, "Failed", "yt-dlp not enabled in build");
+    }
+
+    private long parseYtdlpSpeedBps(String line) {
+        if (line == null) return 0;
+        try {
+            int atIdx = line.indexOf(" at ");
+            if (atIdx < 0) return 0;
+            String rest = line.substring(atIdx + 4).trim();
+            int spIdx = rest.indexOf(' ');
+            if (spIdx > 0) rest = rest.substring(0, spIdx);
+            rest = rest.replace("/s", "").trim();
+            double mult = 1.0;
+            if (rest.endsWith("MiB") || rest.endsWith("MB")) { mult = 1024.0 * 1024.0; rest = rest.replace("MiB", "").replace("MB", ""); }
+            else if (rest.endsWith("KiB") || rest.endsWith("KB")) { mult = 1024.0; rest = rest.replace("KiB", "").replace("KB", ""); }
+            else if (rest.endsWith("GiB") || rest.endsWith("GB")) { mult = 1024.0 * 1024.0 * 1024.0; rest = rest.replace("GiB", "").replace("GB", ""); }
+            double val = Double.parseDouble(rest.trim());
+            return (long) (val * mult);
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private String replaceFileExt(String name, String newExt) {
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) return name.substring(0, dot) + newExt;
+        return name + newExt;
+    }
+
+    private File findLargestFileInDir(File dir) {
+        if (dir == null || !dir.exists()) return null;
+        File[] files = dir.listFiles();
+        if (files == null) return null;
+        File best = null;
+        for (File f : files) {
+            if (f.isFile() && !f.getName().endsWith(".part") && !f.getName().endsWith(".ytdl")) {
+                if (best == null || f.length() > best.length()) best = f;
+            }
+        }
+        return best;
+    }
+
+    private void deleteDirRecursive(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            File[] children = f.listFiles();
+            if (children != null) {
+                for (File c : children) deleteDirRecursive(c);
+            }
+        }
+        try { f.delete(); } catch (Exception ignored) {}
     }
 
     public String moveTempFileToPublicDownloads(File tempFile, String fileName, String mimeType, String subFolder) {
@@ -1119,7 +1354,6 @@ public class MainActivity extends Activity {
             }
         }
 
-        // Method A: Official Android 10+ (API 29+) MediaStore.Downloads (works on Android 10, 11, 12, 13, 14 without storage permission issues!)
         if (Build.VERSION.SDK_INT >= 29) {
             FileInputStream fis = null;
             OutputStream os = null;
@@ -1163,7 +1397,6 @@ public class MainActivity extends Activity {
             }
         }
 
-        // Method B: Direct FileOutputStream in DIRECTORY_DOWNLOADS + MediaScannerConnection (Android 6 - 9 & fallback)
         FileInputStream fis2 = null;
         FileOutputStream fos2 = null;
         try {
@@ -1235,6 +1468,280 @@ public class MainActivity extends Activity {
             Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show();
         }
 
+        // Unlimited Native JSON File Storage (solves 25-tab & 50-download loss on restart!)
+        @JavascriptInterface
+        public boolean saveAppStateFile(String key, String jsonContent) {
+            if (key == null || jsonContent == null) return false;
+            try {
+                String safeKey = key.replaceAll("[^a-zA-Z0-9_-]", "_");
+                File target = new File(activity.getFilesDir(), "cruzdm_" + safeKey + ".json");
+                File tmp = new File(activity.getFilesDir(), "cruzdm_" + safeKey + ".tmp");
+                FileOutputStream fos = new FileOutputStream(tmp);
+                fos.write(jsonContent.getBytes("UTF-8"));
+                fos.flush();
+                fos.close();
+                if (target.exists()) target.delete();
+                return tmp.renameTo(target);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public String loadAppStateFile(String key) {
+            if (key == null) return "";
+            try {
+                String safeKey = key.replaceAll("[^a-zA-Z0-9_-]", "_");
+                File target = new File(activity.getFilesDir(), "cruzdm_" + safeKey + ".json");
+                if (!target.exists() || target.length() == 0) return "";
+                FileInputStream fis = new FileInputStream(target);
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buf = new byte[16384];
+                int r;
+                while ((r = fis.read(buf)) != -1) baos.write(buf, 0, r);
+                fis.close();
+                return new String(baos.toByteArray(), "UTF-8");
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        // Background Tab Real Title Fetcher (reads only first ~32KB of HTML without switching tabs!)
+        @JavascriptInterface
+        public void fetchBackgroundTabTitle(final String tabId, final String urlStr) {
+            if (tabId == null || urlStr == null || (!urlStr.startsWith("http://") && !urlStr.startsWith("https://"))) return;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    HttpURLConnection conn = null;
+                    InputStream is = null;
+                    try {
+                        URL u = new URL(urlStr);
+                        conn = (HttpURLConnection) u.openConnection();
+                        conn.setConnectTimeout(10000);
+                        conn.setReadTimeout(10000);
+                        conn.setInstanceFollowRedirects(true);
+                        conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
+                        String cookies = CookieManager.getInstance().getCookie(urlStr);
+                        if (cookies != null && !cookies.isEmpty()) conn.setRequestProperty("Cookie", cookies);
+                        int code = conn.getResponseCode();
+                        if (code >= 200 && code < 300) {
+                            is = conn.getInputStream();
+                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                            byte[] buf = new byte[4096];
+                            int r;
+                            int total = 0;
+                            while ((r = is.read(buf)) != -1 && total < 36864) {
+                                baos.write(buf, 0, r);
+                                total += r;
+                            }
+                            String headHtml = new String(baos.toByteArray(), "UTF-8");
+                            String extracted = extractTitleFromHtmlHead(headHtml);
+                            if (extracted != null && !extracted.trim().isEmpty()) {
+                                final String finalTitle = extracted.trim();
+                                activity.runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (activity.webView != null) {
+                                            String js = "if(window.onBackgroundTabTitleResolved)window.onBackgroundTabTitleResolved(" +
+                                                JSONObject.quote(tabId) + "," + JSONObject.quote(finalTitle) + ");";
+                                            activity.webView.evaluateJavascript(js, null);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        try { if (is != null) is.close(); } catch (Exception ignored) {}
+                        if (conn != null) conn.disconnect();
+                    }
+                }
+            }).start();
+        }
+
+        private String extractTitleFromHtmlHead(String html) {
+            if (html == null || html.isEmpty()) return "";
+            String lower = html.toLowerCase();
+            int tStart = lower.indexOf("<title");
+            if (tStart >= 0) {
+                int gt = html.indexOf('>', tStart);
+                int tEnd = lower.indexOf("</title>", gt > 0 ? gt : tStart);
+                if (gt > 0 && tEnd > gt) {
+                    return html.substring(gt + 1, tEnd).replaceAll("<[^>]+>", " ").trim();
+                }
+            }
+            return "";
+        }
+
+        // Embedded yt-dlp Info & Formats Extractor (YouTube + 1000+ websites!)
+        @JavascriptInterface
+        public boolean isYtdlpAvailable() {
+            return false;
+        }
+
+        @JavascriptInterface
+        public void extractMediaWithYtdlp(final String requestId, final String targetUrl) {
+            
+        }
+
+        // Strict FIFO Native Queue Controls
+        @JavascriptInterface
+        public void setNativeMaxConcurrent(int maxC) {
+            activity.nativeMaxConcurrent = Math.max(1, Math.min(3, maxC));
+            activity.dispatchNextQueuedNativeJob();
+        }
+
+        @JavascriptInterface
+        public boolean startNativeYtdlpJob(String jobId, String url, String formatSelector, String fileName, String subFolder, boolean isAudioOnly) {
+            try {
+                NativeDownloadJob job = new NativeDownloadJob();
+                job.jobId = jobId;
+                job.type = NativeDownloadJob.TYPE_YTDLP;
+                job.sourceUrl = url;
+                job.formatSelector = formatSelector != null ? formatSelector : "";
+                job.isAudioOnly = isAudioOnly;
+                job.fileName = fileName;
+                job.subFolder = subFolder != null ? subFolder : "";
+                File baseTmp = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (baseTmp == null) baseTmp = activity.getCacheDir();
+                job.tempWorkDir = new File(baseTmp, "ytdlp_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_"));
+                job.queued = true;
+                synchronized (activity.queueLock) {
+                    activity.nativeJobsById.put(jobId, job);
+                    if (!activity.nativeQueueOrder.contains(jobId)) {
+                        activity.nativeQueueOrder.add(jobId);
+                    }
+                }
+                activity.emitNativeJobProgressToUi(jobId, 0, 100, 0, 0, 0, 0, "Queued", "");
+                activity.dispatchNextQueuedNativeJob();
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean startNativeDirectJob(String jobId, String url, String fileName, String mimeType, String subFolder) {
+            try {
+                NativeDownloadJob job = new NativeDownloadJob();
+                job.jobId = jobId;
+                job.type = NativeDownloadJob.TYPE_DIRECT;
+                job.sourceUrl = url;
+                job.fileName = fileName;
+                job.mimeType = mimeType != null ? mimeType : "video/mp4";
+                job.subFolder = subFolder != null ? subFolder : "";
+                job.refererUrl = activity.currentBrowserUrl;
+                File tempDir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (tempDir == null || !tempDir.exists()) tempDir = activity.getCacheDir();
+                job.tempFile = new File(tempDir, "dir_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".tmp");
+                job.queued = true;
+                synchronized (activity.queueLock) {
+                    activity.nativeJobsById.put(jobId, job);
+                    if (!activity.nativeQueueOrder.contains(jobId)) {
+                        activity.nativeQueueOrder.add(jobId);
+                    }
+                }
+                activity.emitNativeJobProgressToUi(jobId, 0, 100, 0, 0, 0, 0, "Queued", "");
+                activity.dispatchNextQueuedNativeJob();
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean startNativeHlsJob(String jobId, String segmentUrlsJson, String initMapUrl, String fileName, String subFolder) {
+            try {
+                JSONArray arr = new JSONArray(segmentUrlsJson);
+                if (arr.length() == 0) return false;
+                String[] urls = new String[arr.length()];
+                for (int i = 0; i < arr.length(); i++) urls[i] = arr.getString(i);
+                NativeDownloadJob job;
+                synchronized (activity.queueLock) {
+                    job = activity.nativeJobsById.get(jobId);
+                    if (job == null) {
+                        job = new NativeDownloadJob();
+                        job.jobId = jobId;
+                        job.type = NativeDownloadJob.TYPE_HLS;
+                        job.segmentUrls = urls;
+                        job.initMapUrl = initMapUrl != null ? initMapUrl : "";
+                        job.fileName = fileName;
+                        job.subFolder = subFolder != null ? subFolder : "";
+                        job.refererUrl = activity.currentBrowserUrl;
+                        job.totalSegments = urls.length;
+                        File tempDir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                        if (tempDir == null || !tempDir.exists()) tempDir = activity.getCacheDir();
+                        job.tempFile = new File(tempDir, "hls_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".tmp");
+                        if (job.tempFile.exists()) job.tempFile.delete();
+                        activity.nativeJobsById.put(jobId, job);
+                    }
+                    job.paused = false;
+                    job.canceled = false;
+                    job.queued = true;
+                    if (!activity.nativeQueueOrder.contains(jobId)) {
+                        activity.nativeQueueOrder.add(jobId);
+                    }
+                }
+                activity.emitNativeJobProgressToUi(jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Queued", "");
+                activity.dispatchNextQueuedNativeJob();
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean pauseNativeHlsJob(String jobId) {
+            synchronized (activity.queueLock) {
+                NativeDownloadJob job = activity.nativeJobsById.get(jobId);
+                if (job != null) {
+                    job.paused = true;
+                    job.running = false;
+                    job.queued = false;
+                    activity.nativeQueueOrder.remove(jobId);
+                    
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @JavascriptInterface
+        public boolean resumeNativeHlsJob(String jobId) {
+            synchronized (activity.queueLock) {
+                NativeDownloadJob job = activity.nativeJobsById.get(jobId);
+                if (job != null && !job.completed && !job.canceled) {
+                    job.paused = false;
+                    job.queued = true;
+                    if (!activity.nativeQueueOrder.contains(jobId)) {
+                        activity.nativeQueueOrder.add(jobId);
+                    }
+                    activity.dispatchNextQueuedNativeJob();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @JavascriptInterface
+        public boolean cancelNativeHlsJob(String jobId) {
+            synchronized (activity.queueLock) {
+                activity.nativeQueueOrder.remove(jobId);
+                NativeDownloadJob job = activity.nativeJobsById.remove(jobId);
+                if (job != null) {
+                    job.canceled = true;
+                    job.running = false;
+                    job.queued = false;
+                    
+                    try { if (job.tempFile != null && job.tempFile.exists()) job.tempFile.delete(); } catch (Exception ignored) {}
+                    if (job.tempWorkDir != null) activity.deleteDirRecursive(job.tempWorkDir);
+                    return true;
+                }
+            }
+            return false;
+        }
+
         @JavascriptInterface
         public void openExternal(final String url) {
             if (url == null || url.trim().isEmpty()) return;
@@ -1256,8 +1763,8 @@ public class MainActivity extends Activity {
                 public void run() {
                     if (activity.browserWebView == null || url == null) return;
                     FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) activity.browserWebView.getLayoutParams();
-                    lp.topMargin = activity.dpToPx(topDp > 0 ? topDp : 92);
-                    lp.bottomMargin = activity.dpToPx(bottomDp > 0 ? bottomDp : 56);
+                    lp.topMargin = activity.dpToPx(topDp > 0 ? topDp : 106);
+                    lp.bottomMargin = activity.dpToPx(bottomDp > 0 ? bottomDp : 58);
                     activity.browserWebView.setLayoutParams(lp);
                     activity.browserDesiredVisible = true;
                     activity.browserWebView.setVisibility(View.VISIBLE);
@@ -1294,39 +1801,25 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void reloadNativeBrowser() {
             activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    if (activity.browserWebView != null) {
-                        activity.browserWebView.reload();
-                    }
-                }
+                @Override public void run() { if (activity.browserWebView != null) activity.browserWebView.reload(); }
             });
         }
 
         @JavascriptInterface
         public boolean goBackNativeBrowser() {
-            final boolean[] wentBack = new boolean[]{ false };
             if (activity.browserWebView != null) {
                 activity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (activity.browserWebView.canGoBack()) {
-                            activity.browserWebView.goBack();
-                        }
-                    }
+                    @Override public void run() { if (activity.browserWebView.canGoBack()) activity.browserWebView.goBack(); }
                 });
-                wentBack[0] = true;
+                return true;
             }
-            return wentBack[0];
+            return false;
         }
 
         @JavascriptInterface
         public void scanNativePage() {
             activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    activity.injectDomMediaScannerIntoBrowser();
-                }
+                @Override public void run() { activity.injectDomMediaScannerIntoBrowser(); }
             });
         }
 
@@ -1379,17 +1872,13 @@ public class MainActivity extends Activity {
                     conn.setRequestProperty("Referer", activity.currentBrowserUrl);
                 }
                 String cookies = CookieManager.getInstance().getCookie(urlStr);
-                if (cookies != null && !cookies.isEmpty()) {
-                    conn.setRequestProperty("Cookie", cookies);
-                }
+                if (cookies != null && !cookies.isEmpty()) conn.setRequestProperty("Cookie", cookies);
                 int code = conn.getResponseCode();
                 if (code >= 200 && code < 300) {
                     BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"));
                     StringBuilder sb = new StringBuilder();
                     String line;
-                    while ((line = br.readLine()) != null) {
-                        sb.append(line).append((char) 10);
-                    }
+                    while ((line = br.readLine()) != null) sb.append(line).append((char) 10);
                     br.close();
                     return sb.toString();
                 }
@@ -1404,7 +1893,6 @@ public class MainActivity extends Activity {
         public String fetchTextWithCookies(String urlStr) {
             if (urlStr == null || (!urlStr.startsWith("http://") && !urlStr.startsWith("https://"))) return "";
             String mobileRes = executeHttpGetText(urlStr, MOBILE_CHROME_UA);
-            // Problem 3: If this is an M3U8 master playlist and does not yet contain 2160/4K, also probe with a 4K Desktop User-Agent!
             if (mobileRes.contains("#EXT-X-STREAM-INF") && !mobileRes.contains("2160") && !mobileRes.contains("3840")) {
                 String desktopRes = executeHttpGetText(urlStr, DESKTOP_4K_UA);
                 if (desktopRes.contains("#EXT-X-STREAM-INF") &&
@@ -1412,9 +1900,7 @@ public class MainActivity extends Activity {
                     return desktopRes;
                 }
             }
-            if (mobileRes.isEmpty()) {
-                return executeHttpGetText(urlStr, DESKTOP_4K_UA);
-            }
+            if (mobileRes.isEmpty()) return executeHttpGetText(urlStr, DESKTOP_4K_UA);
             return mobileRes;
         }
 
@@ -1423,81 +1909,6 @@ public class MainActivity extends Activity {
             if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
                 activity.showLongPressLinkDialog(url, labelTitle);
             }
-        }
-
-        @JavascriptInterface
-        public boolean startNativeHlsJob(String jobId, String segmentUrlsJson, String initMapUrl, String fileName, String subFolder) {
-            try {
-                JSONArray arr = new JSONArray(segmentUrlsJson);
-                if (arr.length() == 0) return false;
-                String[] urls = new String[arr.length()];
-                for (int i = 0; i < arr.length(); i++) {
-                    urls[i] = arr.getString(i);
-                }
-                NativeHlsJob job;
-                synchronized (activity.nativeHlsJobs) {
-                    job = activity.nativeHlsJobs.get(jobId);
-                    if (job == null) {
-                        job = new NativeHlsJob();
-                        job.jobId = jobId;
-                        job.segmentUrls = urls;
-                        job.initMapUrl = initMapUrl != null ? initMapUrl : "";
-                        job.fileName = fileName;
-                        job.subFolder = subFolder != null ? subFolder : "";
-                        job.refererUrl = activity.currentBrowserUrl;
-                        job.totalSegments = urls.length;
-                        File tempDir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-                        if (tempDir == null || !tempDir.exists()) tempDir = activity.getCacheDir();
-                        job.tempFile = new File(tempDir, "hls_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".tmp");
-                        if (job.tempFile.exists()) job.tempFile.delete();
-                        activity.nativeHlsJobs.put(jobId, job);
-                    }
-                }
-                activity.startOrResumeNativeHlsWorker(job);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        @JavascriptInterface
-        public boolean pauseNativeHlsJob(String jobId) {
-            synchronized (activity.nativeHlsJobs) {
-                NativeHlsJob job = activity.nativeHlsJobs.get(jobId);
-                if (job != null) {
-                    job.paused = true;
-                    job.running = false;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        @JavascriptInterface
-        public boolean resumeNativeHlsJob(String jobId) {
-            NativeHlsJob job;
-            synchronized (activity.nativeHlsJobs) {
-                job = activity.nativeHlsJobs.get(jobId);
-            }
-            if (job != null && job.currentSegmentIndex < job.totalSegments) {
-                activity.startOrResumeNativeHlsWorker(job);
-                return true;
-            }
-            return false;
-        }
-
-        @JavascriptInterface
-        public boolean cancelNativeHlsJob(String jobId) {
-            synchronized (activity.nativeHlsJobs) {
-                NativeHlsJob job = activity.nativeHlsJobs.remove(jobId);
-                if (job != null) {
-                    job.canceled = true;
-                    job.running = false;
-                    try { if (job.tempFile != null && job.tempFile.exists()) job.tempFile.delete(); } catch (Exception ignored) {}
-                    return true;
-                }
-            }
-            return false;
         }
 
         @JavascriptInterface
@@ -1559,22 +1970,12 @@ public class MainActivity extends Activity {
                 fos = activity.activeSaveStreams.remove(sessionId);
                 tempFile = activity.activeSaveTempFiles.remove(sessionId);
             }
-            try {
-                if (fos != null) {
-                    fos.flush();
-                    fos.close();
-                }
-            } catch (Exception ignored) {}
-            if (tempFile == null || !tempFile.exists()) {
-                return "ERROR:Temp file not found";
-            }
+            try { if (fos != null) { fos.flush(); fos.close(); } } catch (Exception ignored) {}
+            if (tempFile == null || !tempFile.exists()) return "ERROR:Temp file not found";
             final String result = activity.moveTempFileToPublicDownloads(tempFile, fileName, mimeType, subFolder);
             if (result.startsWith("OK:")) {
                 activity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        Toast.makeText(activity, "تم حفظ الفيديو في التنزيلات: " + fileName, Toast.LENGTH_LONG).show();
-                    }
+                    @Override public void run() { Toast.makeText(activity, "تم حفظ الفيديو في التنزيلات: " + fileName, Toast.LENGTH_LONG).show(); }
                 });
             }
             return result;
@@ -1583,10 +1984,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void downloadUrl(String url, String fileName) {
             activity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    activity.startNativeDownload(url, fileName, "*/*");
-                }
+                @Override public void run() { activity.startNativeDownload(url, fileName, "*/*"); }
             });
         }
 
@@ -1609,12 +2007,6 @@ public class MainActivity extends Activity {
                 String res = finishSaveFile(sId, fileName, mimeType, folderName);
                 return res != null && res.startsWith("OK:");
             } catch (final Exception e) {
-                activity.runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        Toast.makeText(activity, "خطأ أثناء حفظ الملف: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                    }
-                });
                 return false;
             }
         }
@@ -1648,7 +2040,7 @@ public class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationChannel channel = new NotificationChannel(
                     channelId,
-                    "المؤقت وحاسب الجلسات",
+                    "CruzDM Downloads",
                     NotificationManager.IMPORTANCE_LOW
                 );
                 channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
@@ -1667,15 +2059,12 @@ public class MainActivity extends Activity {
             }
             PendingIntent pi = PendingIntent.getActivity(this, 7701, intent, flags);
 
-            Notification.Builder builder;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                builder = new Notification.Builder(this, channelId);
-            } else {
-                builder = new Notification.Builder(this);
-            }
+            Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, channelId)
+                : new Notification.Builder(this);
             builder.setSmallIcon(R.mipmap.ic_launcher)
-                   .setContentTitle(timeStr + " • " + (modeTitle != null ? modeTitle : "المؤقت"))
-                   .setContentText(taskName != null && !taskName.isEmpty() ? taskName : "جلسة تركيز نشطة")
+                   .setContentTitle(timeStr + " • " + (modeTitle != null ? modeTitle : "CruzDM"))
+                   .setContentText(taskName != null && !taskName.isEmpty() ? taskName : "التحميل نشط")
                    .setContentIntent(pi)
                    .setOngoing(isRunning)
                    .setOnlyAlertOnce(true);
