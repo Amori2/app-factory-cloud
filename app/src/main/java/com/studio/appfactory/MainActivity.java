@@ -18,7 +18,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.view.MotionEvent;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaScannerConnection;
 import android.net.ConnectivityManager;
@@ -544,6 +546,30 @@ public class MainActivity extends Activity {
 
         browserWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         browserWebView.addJavascriptInterface(bridge, "AndroidBridge");
+        browserWebView.setOnTouchListener(new View.OnTouchListener() {
+            private float pullStartY = -1f;
+            private boolean pullTriggered = false;
+            @Override
+            public boolean onTouch(View v, MotionEvent ev) {
+                int action = ev.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    pullStartY = (browserWebView.getScrollY() == 0) ? ev.getRawY() : -1f;
+                    pullTriggered = false;
+                } else if (action == MotionEvent.ACTION_MOVE && pullStartY >= 0f && !pullTriggered) {
+                    if (browserWebView.getScrollY() > 0) {
+                        pullStartY = -1f;
+                    } else if ((ev.getRawY() - pullStartY) > dpToPx(110)) {
+                        pullTriggered = true;
+                        Toast.makeText(MainActivity.this, "جاري تحديث الصفحة...", Toast.LENGTH_SHORT).show();
+                        browserWebView.reload();
+                    }
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    pullStartY = -1f;
+                    pullTriggered = false;
+                }
+                return false;
+            }
+        });
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -680,6 +706,7 @@ public class MainActivity extends Activity {
                 }
                 notifyUiBrowserState(currentBrowserUrl, currentBrowserTitle);
                 injectDomMediaScannerIntoBrowser();
+                captureAndSendBrowserThumbnail(currentBrowserUrl);
             }
         });
 
@@ -900,7 +927,7 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         if (webView != null) {
-            try { webView.resumeTimers(); } catch (Exception ignored) {}
+            try { webView.onResume(); webView.resumeTimers(); } catch (Exception ignored) {}
         }
     }
 
@@ -908,7 +935,7 @@ public class MainActivity extends Activity {
     protected void onStop() {
         super.onStop();
         if (webView != null) {
-            try { webView.resumeTimers(); } catch (Exception ignored) {}
+            try { webView.onResume(); webView.resumeTimers(); } catch (Exception ignored) {}
         }
     }
 
@@ -1038,7 +1065,32 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void dispatchNextQueuedNativeJob() {
+    public void captureAndSendBrowserThumbnail(final String urlForThumb) {
+        if (browserWebView == null || webView == null) return;
+        if (browserWebView.getVisibility() != View.VISIBLE || browserWebView.getWidth() <= 0 || browserWebView.getHeight() <= 0) return;
+        try {
+            int w = browserWebView.getWidth();
+            int h = browserWebView.getHeight();
+            int tw = 220;
+            int th = Math.max(140, Math.min(360, (int) ((double) h * tw / Math.max(1, w))));
+            Bitmap bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.RGB_565);
+            Canvas c = new Canvas(bmp);
+            float scale = (float) tw / (float) w;
+            c.scale(scale, scale);
+            browserWebView.draw(c);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            bmp.compress(Bitmap.CompressFormat.JPEG, 60, baos);
+            bmp.recycle();
+            String dataUrl = "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+            String targetU = (urlForThumb != null && !urlForThumb.isEmpty()) ? urlForThumb : currentBrowserUrl;
+            String js = "if(window.onTabThumbnailCaptured)window.onTabThumbnailCaptured(" +
+                JSONObject.quote(targetU != null ? targetU : "") + "," +
+                JSONObject.quote(dataUrl) + ");";
+            webView.evaluateJavascript(js, null);
+        } catch (Exception ignored) {}
+    }
+
+        private void dispatchNextQueuedNativeJob() {
         while (true) {
             final NativeDownloadJob nextJob;
             synchronized (queueLock) {
@@ -1899,8 +1951,54 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void reloadNativeBrowser() {
             activity.runOnUiThread(new Runnable() {
-                @Override public void run() { if (activity.browserWebView != null) activity.browserWebView.reload(); }
+                @Override
+                public void run() {
+                    if (activity.browserWebView != null) {
+                        activity.browserWebView.reload();
+                    }
+                }
             });
+        }
+
+        @JavascriptInterface
+        public void captureTabThumbnail(final String targetUrl) {
+            activity.runOnUiThread(new Runnable() {
+                @Override public void run() { activity.captureAndSendBrowserThumbnail(targetUrl != null ? targetUrl : activity.currentBrowserUrl); }
+            });
+        }
+
+        @JavascriptInterface
+        public void pauseAllNativeJobs() {
+            synchronized (activity.queueLock) {
+                activity.nativeQueueOrder.clear();
+                for (NativeDownloadJob job : activity.nativeJobsById.values()) {
+                    if (job != null && !job.completed && !job.canceled && (job.running || job.queued)) {
+                        job.paused = true;
+                        job.running = false;
+                        job.queued = false;
+                        
+                        activity.emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+                    }
+                }
+            }
+            activity.setDownloadWakeLock(false);
+        }
+
+        @JavascriptInterface
+        public void resumeAllNativeJobs() {
+            synchronized (activity.queueLock) {
+                for (NativeDownloadJob job : activity.nativeJobsById.values()) {
+                    if (job != null && !job.completed && !job.canceled && job.paused) {
+                        job.paused = false;
+                        job.queued = true;
+                        if (!activity.nativeQueueOrder.contains(job.jobId)) {
+                            activity.nativeQueueOrder.add(job.jobId);
+                        }
+                        activity.emitNativeJobProgressToUi(job.jobId, job.currentSegmentIndex, job.totalSegments, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Queued", "");
+                    }
+                }
+            }
+            activity.dispatchNextQueuedNativeJob();
         }
 
         @JavascriptInterface
@@ -1966,8 +2064,16 @@ public class MainActivity extends Activity {
                 conn.setReadTimeout(15000);
                 conn.setInstanceFollowRedirects(true);
                 conn.setRequestProperty("User-Agent", userAgent);
+                conn.setRequestProperty("Accept", "*/*");
+                conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9,ar;q=0.8");
                 if (activity.currentBrowserUrl != null && !activity.currentBrowserUrl.isEmpty()) {
                     conn.setRequestProperty("Referer", activity.currentBrowserUrl);
+                    try {
+                        Uri refUri = Uri.parse(activity.currentBrowserUrl);
+                        if (refUri.getScheme() != null && refUri.getHost() != null) {
+                            conn.setRequestProperty("Origin", refUri.getScheme() + "://" + refUri.getHost());
+                        }
+                    } catch (Exception ignored) {}
                 }
                 String cookies = CookieManager.getInstance().getCookie(urlStr);
                 if (cookies != null && !cookies.isEmpty()) conn.setRequestProperty("Cookie", cookies);
