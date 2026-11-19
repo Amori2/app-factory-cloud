@@ -151,16 +151,37 @@ public class MainActivity extends Activity {
 
     private static final String[] AD_DOMAINS = new String[]{
         "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+        "imasdk.googleapis.com", "pagead2.googlesyndication.com", "tpc.googlesyndication.com",
         "google-analytics.com", "googletagmanager.com", "googletagservices.com", "adnxs.com",
         "adsrvr.org", "popads.net", "popcash.net", "propellerads.com", "adsterra.com",
-        "exoclick.com", "juicyads.com", "trafficjunky.net", "plugrush.com", "hilltopads.net",
-        "clickadu.com", "admaven.com", "revcontent.com", "taboola.com", "outbrain.com",
-        "mgid.com", "criteo.com", "criteo.net", "rubiconproject.com", "pubmatic.com",
-        "openx.net", "casalemedia.com", "smartadserver.com", "advertising.com", "adform.net",
-        "bidswitch.net", "moatads.com", "scorecardresearch.com", "quantserve.com", "hotjar.com",
-        "mouseflow.com", "clarity.ms", "zedo.com", "adroll.com", "teads.tv", "outbrainimg.com",
-        "trc.taboola.com", "tsyndicate.com", "realsrv.com", "exdynsrv.com", "aucdn.net",
-        "onclkds.com", "onclickalgo.com", "adsco.re", "popunder.net", "adcash.com", "bidvertiser.com"
+        "exoclick.com", "exosrv.com", "exdynsrv.com", "realsrv.com", "magsrv.com", "tsyndicate.com",
+        "juicyads.com", "trafficjunky.net", "trafficstars.com", "plugrush.com", "hilltopads.net",
+        "clickadu.com", "clickadilla.com", "admaven.com", "adspyglass.com", "adcash.com",
+        "monetag.com", "propu.sh", "onclickperformance.com", "onclkds.com", "onclickalgo.com",
+        "highperformanceformat.com", "profitablegate.com", "effectivegatecpm.com", "topcreativeformat.com",
+        "galaksion.com", "evadav.com", "pushhouse.net", "richads.com", "zeropark.com",
+        "revcontent.com", "taboola.com", "outbrain.com", "mgid.com", "criteo.com", "criteo.net",
+        "rubiconproject.com", "pubmatic.com", "openx.net", "casalemedia.com", "smartadserver.com",
+        "advertising.com", "adform.net", "bidswitch.net", "moatads.com", "scorecardresearch.com",
+        "quantserve.com", "hotjar.com", "mouseflow.com", "clarity.ms", "zedo.com", "adroll.com",
+        "teads.tv", "outbrainimg.com", "trc.taboola.com", "aucdn.net", "adsco.re", "popunder.net",
+        "bidvertiser.com", "adcolony.com", "applovin.com", "vungle.com", "unityads.unity3d.com",
+        "inmobi.com", "chartboost.com", "tapjoy.com", "ironsrc.com", "smaato.net", "pubnative.net",
+        "sharethrough.com", "triplelift.com", "indexww.com", "33across.com", "gumgum.com",
+        "yieldmo.com", "kargo.com", "sovrn.com", "lijit.com", "amazon-adsystem.com", "aaxads.com",
+        "mediavine.com", "adthrive.com", "ezoic.net", "ezojs.com", "carbonads.net", "buysellads.com",
+        "undertone.com", "connatix.com", "primis.tech", "aniview.com", "springserve.com",
+        "spotxchange.com", "spotx.tv", "lkqd.net", "fwmrm.net", "innovid.com", "flashtalking.com",
+        "celtra.com", "sizmek.com", "serving-sys.com", "adobedtm.com", "omtrdc.net", "demdex.net",
+        "krxd.net", "bluekai.com", "exelator.com", "rlcdn.com", "tapad.com", "crwdcntrl.net",
+        "narrative.io", "permutive.com", "piano.io", "tinypass.com", "bounceexchange.com",
+        "optinmonster.com", "sumo.com", "pushengage.com", "onesignal.com", "izooto.com",
+        "subscribers.com", "aimtell.com", "webpushr.com", "gravitec.net", "sendpulse.com",
+        "acint.net", "adnium.com", "adskeeper.co.uk", "adtelligent.com", "adtrue.com",
+        "a-ads.com", "betterbanners.org", "chaturbate.com", "stripchat.com", "bongacams.com",
+        "livejasmin.com", "camsoda.com", "bet365.com", "1xbet.com", "melbet.com", "mostbet.com",
+        "stake.com", "bc.game", "shorte.st", "adf.ly", "ouo.io", "shrinkme.io", "exe.io",
+        "bc.vc", "linkvertise.com", "work.ink", "loot-link.com", "adtng.com", "ero-advertising.com"
     };
 
     private int dpToPx(int dp) {
@@ -200,10 +221,27 @@ public class MainActivity extends Activity {
                 }
             }
         } catch (Exception ignored) {}
-        return s.contains("/popunder") || s.contains("/adserver/") || s.contains("/popads/");
+        return s.contains("/popunder") || s.contains("/adserver/") || s.contains("/popads/") || s.contains("/vast") || s.contains("/vpaid") || s.contains("/preroll") || s.contains("/afu.php") || s.contains("/multitag") || s.contains("pop.js") || s.contains("/ads/js") || s.contains("/ad_banner") || s.contains("doubleclick");
     }
 
-    private boolean isSniffableMediaUrl(String rawUrl) {
+    private boolean isCrossDomainPopup(String currentUrl, String popupUrl) {
+        if (currentUrl == null || currentUrl.isEmpty() || popupUrl == null) return false;
+        try {
+            String h1 = Uri.parse(currentUrl).getHost();
+            String h2 = Uri.parse(popupUrl).getHost();
+            if (h1 == null || h2 == null) return true;
+            h1 = h1.toLowerCase();
+            h2 = h2.toLowerCase();
+            if (h1.startsWith("www.")) h1 = h1.substring(4);
+            if (h2.startsWith("www.")) h2 = h2.substring(4);
+            if (h1.equals(h2) || h2.endsWith("." + h1) || h1.endsWith("." + h2)) return false;
+            return true;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+        private boolean isSniffableMediaUrl(String rawUrl) {
         if (rawUrl == null) return false;
         String s = rawUrl.trim();
         if (!s.startsWith("http://") && !s.startsWith("https://")) return false;
@@ -328,18 +366,51 @@ public class MainActivity extends Activity {
 
     private void injectDomMediaScannerIntoBrowser() {
         if (browserWebView == null) return;
+        String abFlag = nativeAdBlockEnabled ? "true" : "false";
         String js = "(function(){try{" +
+            "var AB=" + abFlag + ";" +
+            "if(AB&&!window._cruzShieldsActive){window._cruzShieldsActive=true;" +
+            "var st=document.createElement('style');st.id='cruz-brave-css';" +
+            "st.textContent='ins.adsbygoogle,[id*=google_ads],[class*=popunder],[id*=popunder],[class*=ad-overlay],[class*=video-ad],[id*=taboola],[id*=outbrain],iframe[src*=doubleclick],iframe[src*=googlesyndication],iframe[src*=exoclick],iframe[src*=adsterra]{display:none!important;pointer-events:none!important;visibility:hidden!important;}';" +
+            "(document.head||document.documentElement).appendChild(st);" +
+            "window.open=function(){return {closed:true,focus:function(){},blur:function(){},close:function(){}};};" +
+            "var origClick=HTMLElement.prototype.click;" +
+            "HTMLElement.prototype.click=function(){try{if(this.tagName==='A'&&this.target==='_blank'&&this.hostname&&this.hostname!==location.hostname)return;}catch(e){}return origClick.apply(this,arguments);};" +
+            "document.addEventListener('click',function(ev){try{" +
+            "var el=ev.target;if(!el)return;" +
+            "var cs=window.getComputedStyle(el);" +
+            "var zi=parseInt(cs.zIndex,10)||0;" +
+            "if((cs.position==='fixed'||cs.position==='absolute')&&zi>=99&&el.tagName!=='VIDEO'&&el.tagName!=='BUTTON'&&!el.querySelector('video')){" +
+            "var bg=cs.backgroundColor||'';var op=parseFloat(cs.opacity||'1');" +
+            "if(op<0.15||bg==='rgba(0, 0, 0, 0)'||bg==='transparent'){" +
+            "var r=el.getBoundingClientRect();" +
+            "if(r.width>180&&r.height>120){ev.preventDefault();ev.stopPropagation();el.style.display='none';el.style.pointerEvents='none';return;}" +
+            "}}" +
+            "var a=el.closest?el.closest('a[href]'):null;" +
+            "if(a&&a.target==='_blank'&&a.hostname&&a.hostname!==location.hostname){" +
+            "var hrefL=(a.href||'').toLowerCase();" +
+            "if(hrefL.indexOf('ad')!==-1||hrefL.indexOf('pop')!==-1||hrefL.indexOf('click')!==-1||hrefL.indexOf('track')!==-1||hrefL.indexOf('bet')!==-1||hrefL.indexOf('cam')!==-1){ev.preventDefault();ev.stopPropagation();}" +
+            "}" +
+            "}catch(e){}},true);" +
+            "}" +
             "var pt='';" +
             "var ms=document.getElementsByTagName('meta');for(var m=0;m<ms.length;m++){var p=ms[m].getAttribute('property')||ms[m].getAttribute('name')||'';if(p==='og:title'||p==='twitter:title'){pt=(ms[m].getAttribute('content')||'').trim();if(pt)break;}}" +
             "if(!pt&&document.title)pt=document.title.trim();" +
             "if(window.AndroidBridge&&window.AndroidBridge.reportPageTitle&&pt)window.AndroidBridge.reportPageTitle(pt,location.href);" +
+            "var seen={};function rep(u,q){if(!u||seen[u])return;seen[u]=1;try{u=new URL(u,location.href).href;}catch(e){}if(window.AndroidBridge&&window.AndroidBridge.reportDetectedMediaFromJs)window.AndroidBridge.reportDetectedMediaFromJs(u,pt,q||'');}" +
             "var els=document.querySelectorAll('video,audio,video source,audio source,source');" +
             "for(var i=0;i<els.length;i++){" +
             "var e=els[i];var u=e.currentSrc||e.src||e.getAttribute('src')||e.getAttribute('data-src')||'';" +
-            "if(u&&window.AndroidBridge&&window.AndroidBridge.reportDetectedMediaFromJs){" +
-            "var q=e.getAttribute('label')||e.getAttribute('res')||e.getAttribute('size')||'';" +
-            "window.AndroidBridge.reportDetectedMediaFromJs(u,pt,q);" +
-            "}}" +
+            "if(u)rep(u,e.getAttribute('label')||e.getAttribute('res')||e.getAttribute('size')||'');" +
+            "}" +
+            // Proactive Pre-Play Script Scanner: finds .m3u8 / .mpd / .mp4 URLs embedded in page scripts BEFORE pressing Play!
+            "var scs=document.getElementsByTagName('script');" +
+            "for(var s=0;s<scs.length;s++){var tx=scs[s].textContent||'';if(tx.length>20&&tx.length<250000&&(tx.indexOf('.m3u8')!==-1||tx.indexOf('.mp4')!==-1||tx.indexOf('.mpd')!==-1)){" +
+            "var norm=tx.split(String.fromCharCode(92)+'/').join('/');" +
+            "var parts=norm.split('http');for(var k=1;k<parts.length&&k<20;k++){" +
+            "var cand='http'+parts[k].split(String.fromCharCode(34))[0].split(String.fromCharCode(39))[0].split(' ')[0].split(')')[0];" +
+            "if(cand.length>15&&cand.length<500&&(cand.indexOf('.m3u8')!==-1||cand.indexOf('.mp4')!==-1||cand.indexOf('.mpd')!==-1))rep(cand,'');" +
+            "}}}" +
             "if(!window._cruzLpBound){window._cruzLpBound=true;" +
             "document.addEventListener('contextmenu',function(ev){try{" +
             "var t=ev.target;if(!t||!t.closest)return;" +
@@ -362,7 +433,7 @@ public class MainActivity extends Activity {
         System.setProperty("http.maxConnections", "8");
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
-        
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
         
         String initBgHex = "#090D16";
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -633,6 +704,8 @@ public class MainActivity extends Activity {
                         if (handled || url == null) return;
                         handled = true;
                         if (isNativeAdOrTrackerUrl(url) || url.startsWith("intent://") || url.startsWith("market://")) {
+                            notifyUiAdBlocked();
+                        } else if (nativeAdBlockEnabled && isCrossDomainPopup(currentBrowserUrl, url)) {
                             notifyUiAdBlocked();
                         } else if (url.startsWith("http://") || url.startsWith("https://")) {
                             notifyUiNewInternalTab(url);
@@ -1108,6 +1181,12 @@ public class MainActivity extends Activity {
                 fos.flush();
                 job.downloadedBytes += segBytes.length;
                 job.currentSegmentIndex = i + 1;
+                try {
+                    File sf = new File(getFilesDir(), "hls_state_" + job.jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".txt");
+                    FileOutputStream sfos = new FileOutputStream(sf);
+                    sfos.write(String.valueOf(job.currentSegmentIndex).getBytes("UTF-8"));
+                    sfos.close();
+                } catch (Exception ignored) {}
 
                 long now = System.currentTimeMillis();
                 if (now - lastTickTime >= 600) {
@@ -1673,7 +1752,26 @@ public class MainActivity extends Activity {
                         File tempDir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
                         if (tempDir == null || !tempDir.exists()) tempDir = activity.getCacheDir();
                         job.tempFile = new File(tempDir, "hls_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".tmp");
-                        if (job.tempFile.exists()) job.tempFile.delete();
+                        // Do NOT delete existing tempFile if resuming from saved segment index!
+                        File stateFile = new File(activity.getFilesDir(), "hls_state_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_") + ".txt");
+                        if (job.tempFile.exists() && stateFile.exists()) {
+                            try {
+                                FileInputStream sfis = new FileInputStream(stateFile);
+                                byte[] sb = new byte[(int) Math.min(64, stateFile.length())];
+                                int sr = sfis.read(sb);
+                                sfis.close();
+                                if (sr > 0) {
+                                    int savedIdx = Integer.parseInt(new String(sb, 0, sr, "UTF-8").trim());
+                                    if (savedIdx > 0 && savedIdx < urls.length) {
+                                        job.currentSegmentIndex = savedIdx;
+                                        job.downloadedBytes = job.tempFile.length();
+                                        job.initDownloaded = true;
+                                    }
+                                }
+                            } catch (Exception ignored) {}
+                        } else if (job.tempFile.exists()) {
+                            job.tempFile.delete();
+                        }
                         activity.nativeJobsById.put(jobId, job);
                     }
                     job.paused = false;
