@@ -80,7 +80,12 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-
+import com.yausername.youtubedl_android.YoutubeDL;
+import com.yausername.youtubedl_android.YoutubeDLRequest;
+import com.yausername.youtubedl_android.YoutubeDLResponse;
+import com.yausername.ffmpeg.FFmpeg;
+import kotlin.Unit;
+import kotlin.jvm.functions.Function3;
 
 public class MainActivity extends Activity {
     private FrameLayout rootLayout;
@@ -200,11 +205,33 @@ public class MainActivity extends Activity {
     }
 
     private void initEmbeddedYtdlpAsync() {
-        
+        if (ytdlpReady || ytdlpInitializing) return;
+        ytdlpInitializing = true;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    YoutubeDL.getInstance().init(getApplicationContext());
+                    try { FFmpeg.getInstance().init(getApplicationContext()); } catch (Exception ignored) {}
+                    ytdlpReady = true;
+                } catch (Exception e) {
+                    ytdlpInitError = e.getMessage() != null ? e.getMessage() : "Init failed";
+                } finally {
+                    ytdlpInitializing = false;
+                }
+            }
+        }).start();
     }
 
     private boolean waitForYtdlpReady(int maxSeconds) {
-        return false;
+        if (ytdlpReady) return true;
+        initEmbeddedYtdlpAsync();
+        long end = System.currentTimeMillis() + (maxSeconds * 1000L);
+        while (!ytdlpReady && System.currentTimeMillis() < end) {
+            if (!ytdlpInitializing && !ytdlpInitError.isEmpty()) break;
+            try { Thread.sleep(250); } catch (Exception ignored) { break; }
+        }
+        return ytdlpReady;
     }
 
     private boolean isNativeAdOrTrackerUrl(String rawUrl) {
@@ -433,7 +460,7 @@ public class MainActivity extends Activity {
         System.setProperty("http.maxConnections", "8");
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
-        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        
         
         String initBgHex = "#090D16";
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1365,7 +1392,154 @@ public class MainActivity extends Activity {
     }
 
     private void runYtdlpJobSync(final NativeDownloadJob job) {
-        emitNativeJobProgressToUi(job.jobId, 0, 100, 0, 0, 0, 0, "Failed", "yt-dlp not enabled in build");
+        try {
+            if (!waitForYtdlpReady(25)) {
+                job.paused = true;
+                emitNativeJobProgressToUi(job.jobId, 0, 100, 0, 0, 0, 0, "Failed", "محرك yt-dlp غير جاهز: " + ytdlpInitError);
+                return;
+            }
+            if (job.tempWorkDir != null && !job.tempWorkDir.exists()) {
+                job.tempWorkDir.mkdirs();
+            }
+            emitNativeJobProgressToUi(job.jobId, Math.max(1, job.lastPercent), 100, job.downloadedBytes, job.totalBytes, 0, Math.max(1, job.lastPercent), "Downloading", "جاري التحميل...");
+
+            boolean isYoutube = job.sourceUrl != null && (job.sourceUrl.toLowerCase().contains("youtube.com") || job.sourceUrl.toLowerCase().contains("youtu.be"));
+            String outPattern = job.tempWorkDir.getAbsolutePath() + "/cruz_out.%(ext)s";
+            String chosenFmt = (job.formatSelector != null && !job.formatSelector.trim().isEmpty())
+                ? job.formatSelector.trim()
+                : "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
+
+            // 3-tier strategy so YouTube PO-token / 403 / FFmpeg issues NEVER cause download failure!
+            String[][] strategies = isYoutube ? new String[][]{
+                new String[]{ "android_vr,android,web", chosenFmt, "1" },
+                new String[]{ "tv,ios,mweb", "bestvideo+bestaudio/best", "1" },
+                new String[]{ "android,web", "18/best[ext=mp4]/best", "0" }
+            } : new String[][]{
+                new String[]{ "", chosenFmt, "1" },
+                new String[]{ "", "best[ext=mp4]/best", "0" }
+            };
+
+            Function3<Float, Long, String, Unit> cb = new Function3<Float, Long, String, Unit>() {
+                @Override
+                public Unit invoke(Float progress, Long etaInSeconds, String line) {
+                    int pct = progress != null ? Math.max(0, Math.min(99, Math.round(progress.floatValue()))) : job.lastPercent;
+                    if (pct > job.lastPercent) job.lastPercent = pct;
+                    long parsedSpeed = parseYtdlpSpeedBps(line);
+                    showOrUpdateLockScreenTimer("CruzDM (" + job.lastPercent + "%)", job.lastPercent + "%", job.fileName, true);
+                    emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, parsedSpeed, job.lastPercent, "Downloading", line != null ? line : "");
+                    return Unit.INSTANCE;
+                }
+            };
+
+            Exception lastExecErr = null;
+            boolean execSucceeded = false;
+            for (int sIdx = 0; sIdx < strategies.length; sIdx++) {
+                if (job.paused || job.canceled) break;
+                String clientArg = strategies[sIdx][0];
+                String fmtArg = strategies[sIdx][1];
+                boolean useMerge = "1".equals(strategies[sIdx][2]);
+                try {
+                    YoutubeDLRequest req = new YoutubeDLRequest(job.sourceUrl);
+                    req.addOption("--continue");
+                    req.addOption("--no-mtime");
+                    req.addOption("--no-playlist");
+                    req.addOption("--no-check-certificates");
+                    req.addOption("--newline");
+                    req.addOption("--retries", "10");
+                    req.addOption("--fragment-retries", "10");
+                    req.addOption("--socket-timeout", "30");
+                    req.addOption("--concurrent-fragments", "3");
+                    if (clientArg != null && !clientArg.isEmpty()) {
+                        req.addOption("--extractor-args", "youtube:player_client=" + clientArg);
+                    }
+                    if (job.isAudioOnly) {
+                        req.addOption("-f", "bestaudio[ext=m4a]/bestaudio/best");
+                        if (useMerge) {
+                            req.addOption("-x");
+                            req.addOption("--audio-format", "mp3");
+                            req.addOption("--audio-quality", "0");
+                        }
+                    } else {
+                        req.addOption("-f", fmtArg);
+                        if (useMerge) {
+                            req.addOption("--merge-output-format", "mp4");
+                        }
+                    }
+                    req.addOption("-o", outPattern);
+                    YoutubeDL.getInstance().execute(req, job.jobId, cb);
+                    File checkProd = findLargestFileInDir(job.tempWorkDir);
+                    if (checkProd != null && checkProd.exists() && checkProd.length() > 4096) {
+                        execSucceeded = true;
+                        break;
+                    }
+                } catch (Exception exTry) {
+                    lastExecErr = exTry;
+                    if (job.paused || job.canceled) break;
+                }
+            }
+
+            if (job.canceled) {
+                deleteDirRecursive(job.tempWorkDir);
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, 0, 0, 0, job.lastPercent, "Canceled", "");
+                return;
+            }
+            if (job.paused) {
+                // Keep tempWorkDir (.part files) intact on disk for exact byte-level resume!
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+                return;
+            }
+
+            File produced = findLargestFileInDir(job.tempWorkDir);
+            if (!execSucceeded || produced == null || !produced.exists() || produced.length() == 0) {
+                job.paused = true;
+                String errMsg = (lastExecErr != null && lastExecErr.getMessage() != null) ? lastExecErr.getMessage() : "تعذر إكمال التحميل";
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, 0, 0, 0, job.lastPercent, "Failed", errMsg);
+                return;
+            }
+
+            job.downloadedBytes = produced.length();
+            job.totalBytes = produced.length();
+            job.completed = true;
+            emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.totalBytes, 0, 100, "Saving", "");
+
+            String outName = job.fileName;
+            String prodName = produced.getName().toLowerCase();
+            String finalMime = job.isAudioOnly ? "audio/mpeg" : "video/mp4";
+            if (prodName.endsWith(".mp3")) {
+                finalMime = "audio/mpeg";
+                if (!outName.toLowerCase().endsWith(".mp3")) outName = replaceFileExt(outName, ".mp3");
+            } else if (prodName.endsWith(".m4a")) {
+                finalMime = "audio/mp4";
+                if (!outName.toLowerCase().endsWith(".m4a")) outName = replaceFileExt(outName, ".m4a");
+            } else if (prodName.endsWith(".mkv")) {
+                finalMime = "video/x-matroska";
+                if (!outName.toLowerCase().endsWith(".mkv")) outName = replaceFileExt(outName, ".mkv");
+            } else if (prodName.endsWith(".webm")) {
+                finalMime = "video/webm";
+                if (!outName.toLowerCase().endsWith(".webm")) outName = replaceFileExt(outName, ".webm");
+            }
+
+            String savedRes = moveTempFileToPublicDownloads(produced, outName, finalMime, job.subFolder);
+            deleteDirRecursive(job.tempWorkDir);
+            showOrUpdateLockScreenTimer("", "00:00", "", false);
+
+            if (savedRes.startsWith("OK:")) {
+                final String toastName = outName;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() { Toast.makeText(MainActivity.this, "تم الحفظ: " + toastName, Toast.LENGTH_LONG).show(); }
+                });
+                emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.totalBytes, 0, 100, "Completed", savedRes);
+            } else {
+                emitNativeJobProgressToUi(job.jobId, 100, 100, job.downloadedBytes, job.totalBytes, 0, 100, "SaveFailed", savedRes);
+            }
+        } catch (Exception e) {
+            if (!job.paused && !job.canceled) {
+                job.paused = true;
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Failed", e.getMessage());
+            } else if (job.paused) {
+                emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Paused", "");
+            }
+        }
     }
 
     private long parseYtdlpSpeedBps(String line) {
@@ -1656,12 +1830,118 @@ public class MainActivity extends Activity {
         // Embedded yt-dlp Info & Formats Extractor (YouTube + 1000+ websites!)
         @JavascriptInterface
         public boolean isYtdlpAvailable() {
-            return false;
+            return true;
         }
 
         @JavascriptInterface
         public void extractMediaWithYtdlp(final String requestId, final String targetUrl) {
-            
+            if (targetUrl == null || targetUrl.trim().isEmpty()) return;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    JSONObject outObj = new JSONObject();
+                    try {
+                        if (!activity.waitForYtdlpReady(25)) {
+                            outObj.put("ok", false);
+                            outObj.put("error", "جاري تهيئة محرك yt-dlp، حاول مجدداً بعد ثوانٍ: " + activity.ytdlpInitError);
+                        } else {
+                            YoutubeDLRequest req = new YoutubeDLRequest(targetUrl.trim());
+                            req.addOption("--dump-single-json");
+                            req.addOption("--no-check-certificates");
+                            if (targetUrl.toLowerCase().contains("youtube.com") || targetUrl.toLowerCase().contains("youtu.be")) {
+                                req.addOption("--extractor-args", "youtube:player_client=android_vr,android,web");
+                            }
+                            req.addOption("--no-playlist");
+                            req.addOption("--no-warnings");
+                            req.addOption("--socket-timeout", "25");
+                            YoutubeDLResponse resp = YoutubeDL.getInstance().execute(req, "info_" + requestId, null);
+                            String rawJson = resp != null ? resp.getOut() : "";
+                            if (rawJson == null || rawJson.trim().isEmpty()) {
+                                outObj.put("ok", false);
+                                outObj.put("error", "لم يتم العثور على فيديو قابل للاستخراج");
+                            } else {
+                                int braceIdx = rawJson.indexOf('{');
+                                if (braceIdx > 0) rawJson = rawJson.substring(braceIdx);
+                                JSONObject info = new JSONObject(rawJson);
+                                outObj.put("ok", true);
+                                outObj.put("title", info.optString("title", "Video"));
+                                outObj.put("duration", info.optInt("duration", 0));
+                                outObj.put("thumbnail", info.optString("thumbnail", ""));
+                                outObj.put("extractor", info.optString("extractor_key", info.optString("extractor", "")));
+
+                                JSONArray fmts = info.optJSONArray("formats");
+                                Map<Integer, JSONObject> bestByHeight = new LinkedHashMap<Integer, JSONObject>();
+                                long bestAudioSize = 0;
+                                if (fmts != null) {
+                                    for (int i = 0; i < fmts.length(); i++) {
+                                        JSONObject f = fmts.optJSONObject(i);
+                                        if (f == null) continue;
+                                        String vcodec = f.optString("vcodec", "none");
+                                        String acodec = f.optString("acodec", "none");
+                                        long fsize = f.optLong("filesize", 0);
+                                        if (fsize <= 0) fsize = f.optLong("filesize_approx", 0);
+                                        if ("none".equalsIgnoreCase(vcodec) && !"none".equalsIgnoreCase(acodec)) {
+                                            if (fsize > bestAudioSize) bestAudioSize = fsize;
+                                            continue;
+                                        }
+                                        int h = f.optInt("height", 0);
+                                        if (h < 144) continue;
+                                        String fid = f.optString("format_id", "");
+                                        if (fid.isEmpty()) continue;
+                                        String ext = f.optString("ext", "mp4");
+                                        boolean hasAudio = !"none".equalsIgnoreCase(acodec);
+                                        JSONObject prev = bestByHeight.get(h);
+                                        boolean replace = (prev == null);
+                                        if (!replace) {
+                                            boolean prevMp4 = "mp4".equalsIgnoreCase(prev.optString("ext", ""));
+                                            boolean curMp4 = "mp4".equalsIgnoreCase(ext);
+                                            if (curMp4 && !prevMp4) replace = true;
+                                            else if (fsize > prev.optLong("sizeBytes", 0)) replace = true;
+                                        }
+                                        if (replace) {
+                                            JSONObject entry = new JSONObject();
+                                            entry.put("height", h);
+                                            entry.put("label", h >= 2160 ? "2160p 4K" : (h >= 1440 ? "1440p 2K" : (h >= 1080 ? "1080p FHD" : (h >= 720 ? "720p HD" : (h + "p")))));
+                                            entry.put("formatSelector", hasAudio ? fid : ("bestvideo[height<=" + h + "][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=" + h + "]+bestaudio/best[height<=" + h + "]"));
+                                            entry.put("ext", "mp4");
+                                            entry.put("sizeBytes", hasAudio ? fsize : (fsize > 0 ? fsize + bestAudioSize : 0));
+                                            entry.put("directUrl", f.optString("url", ""));
+                                            bestByHeight.put(h, entry);
+                                        }
+                                    }
+                                }
+                                List<JSONObject> sortedVideos = new ArrayList<JSONObject>(bestByHeight.values());
+                                Collections.sort(sortedVideos, new Comparator<JSONObject>() {
+                                    @Override
+                                    public int compare(JSONObject a, JSONObject b) {
+                                        return Integer.compare(b.optInt("height", 0), a.optInt("height", 0));
+                                    }
+                                });
+                                JSONArray videoArr = new JSONArray();
+                                for (JSONObject v : sortedVideos) videoArr.put(v);
+                                outObj.put("videoFormats", videoArr);
+                                outObj.put("audioSizeBytes", bestAudioSize);
+                            }
+                        }
+                    } catch (Exception e) {
+                        try {
+                            outObj.put("ok", false);
+                            outObj.put("error", e.getMessage() != null ? e.getMessage() : "Extraction failed");
+                        } catch (Exception ignored) {}
+                    }
+                    final String jsonRes = outObj.toString();
+                    activity.runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (activity.webView != null) {
+                                String js = "if(window.onYtdlpInfoExtracted)window.onYtdlpInfoExtracted(" +
+                                    JSONObject.quote(requestId) + "," + JSONObject.quote(jsonRes) + ");";
+                                activity.webView.evaluateJavascript(js, null);
+                            }
+                        }
+                    });
+                }
+            }).start();
         }
 
         // Strict FIFO Native Queue Controls
@@ -1798,7 +2078,7 @@ public class MainActivity extends Activity {
                     job.running = false;
                     job.queued = false;
                     activity.nativeQueueOrder.remove(jobId);
-                    
+                    if (job.type == NativeDownloadJob.TYPE_YTDLP) { try { YoutubeDL.getInstance().destroyProcessById(jobId); } catch (Exception ignored) {} }
                     return true;
                 }
             }
@@ -1831,7 +2111,7 @@ public class MainActivity extends Activity {
                     job.canceled = true;
                     job.running = false;
                     job.queued = false;
-                    
+                    if (job.type == NativeDownloadJob.TYPE_YTDLP) { try { YoutubeDL.getInstance().destroyProcessById(jobId); } catch (Exception ignored) {} }
                     try { if (job.tempFile != null && job.tempFile.exists()) job.tempFile.delete(); } catch (Exception ignored) {}
                     if (job.tempWorkDir != null) activity.deleteDirRecursive(job.tempWorkDir);
                     return true;

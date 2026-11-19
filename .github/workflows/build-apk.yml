@@ -51,6 +51,6 @@ jobs:
       - name: Publish Direct Release APK
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v-1795098676484
+          tag_name: v-1795099946073
           name: "App Factory (9.0.0)"
           files: com_studio_appfactory.apk
