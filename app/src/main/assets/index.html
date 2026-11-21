@@ -5408,7 +5408,38 @@ public class DownloadKeepAliveService extends Service {
     }
 
     function toBase64Utf8(str) {
-      return btoa(unescape(encodeURIComponent(str)));
+      const bytes = new TextEncoder().encode(String(str || ''));
+      let bin = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(bin);
+    }
+
+    async function uploadGithubBlobWithRetry(owner, repo, headers, payloadObj, label) {
+      let lastStatus = 0;
+      let lastErrText = '';
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const bRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payloadObj)
+          });
+          if (bRes.ok) {
+            return await bRes.json();
+          }
+          lastStatus = bRes.status;
+          try { lastErrText = (await bRes.text()).slice(0, 140); } catch (e) {}
+          logMsg(`Retry ${attempt}/3 for ${label} (HTTP ${lastStatus})...`);
+        } catch (netErr) {
+          lastErrText = netErr.message || 'Network error';
+          logMsg(`Retry ${attempt}/3 for ${label} (${lastErrText})...`);
+        }
+        if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
+      throw new Error(`فشل رفع الملف: ${label} (HTTP ${lastStatus || 'ERR'} ${lastErrText})`);
     }
 
     document.getElementById('exportZipBtn').addEventListener('click', async () => {
@@ -5495,24 +5526,12 @@ public class DownloadKeepAliveService extends Service {
         const treeItems = [];
         for (const [path, content] of Object.entries(proj)) {
           if (path === 'icons') continue;
-          const bRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ content: toBase64Utf8(content), encoding: 'base64' })
-          });
-          if (!bRes.ok) throw new Error(`فشل رفع الملف النصي: ${path}`);
-          const bData = await bRes.json();
+          const bData = await uploadGithubBlobWithRetry(owner, repo, headers, { content: String(content), encoding: 'utf-8' }, path);
           treeItems.push({ path, mode: '100644', type: 'blob', sha: bData.sha });
         }
 
         for (const [path, b64] of Object.entries(proj.icons)) {
-          const bRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/blobs`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ content: b64, encoding: 'base64' })
-          });
-          if (!bRes.ok) throw new Error(`فشل رفع الملف الثنائي: ${path}`);
-          const bData = await bRes.json();
+          const bData = await uploadGithubBlobWithRetry(owner, repo, headers, { content: b64, encoding: 'base64' }, path);
           treeItems.push({ path, mode: '100644', type: 'blob', sha: bData.sha });
         }
 
