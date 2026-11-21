@@ -55,6 +55,7 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
@@ -92,8 +93,8 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> filePathCallback;
     private static final int FILE_CHOOSER_CODE = 1001;
     private static final int PERMISSION_REQ_CODE = 1002;
-    private static final String MOBILE_CHROME_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-    private static final String DESKTOP_4K_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    private static final String MOBILE_CHROME_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36";
+    private static final String DESKTOP_4K_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Safari/537.36";
 
     private PowerManager.WakeLock downloadWakeLock;
     private WifiManager.WifiLock downloadWifiLock;
@@ -148,6 +149,7 @@ public class MainActivity extends Activity {
     private volatile boolean nativeAdBlockEnabled = true;
     private volatile String currentBrowserUrl = "";
     private volatile String currentBrowserTitle = "";
+    private volatile long currentPageGenId = 1;
     private boolean browserDesiredVisible = false;
     private int lastDetectedCount = 0;
 
@@ -292,16 +294,20 @@ public class MainActivity extends Activity {
     public void notifyUiMediaDetected(final String mediaUrl, final String pageTitle, final String qualityHint) {
         if (webView == null || mediaUrl == null) return;
         if (isNativeAdOrTrackerUrl(mediaUrl)) return;
+        final long capturedGen = currentPageGenId;
+        final String capturedPageUrl = currentBrowserUrl != null ? currentBrowserUrl : "";
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
+                    if (capturedGen != currentPageGenId) return;
                     String safeTitle = (pageTitle != null && !pageTitle.trim().isEmpty()) ? pageTitle.trim() : currentBrowserTitle;
                     String js = "if(window.onNativeMediaSniffed)window.onNativeMediaSniffed(" +
                         JSONObject.quote(mediaUrl) + "," +
                         JSONObject.quote(safeTitle != null ? safeTitle : "") + "," +
                         JSONObject.quote(qualityHint != null ? qualityHint : "") + "," +
-                        JSONObject.quote(currentBrowserUrl != null ? currentBrowserUrl : "") + ");";
+                        JSONObject.quote(capturedPageUrl) + "," +
+                        capturedGen + ");";
                     webView.evaluateJavascript(js, null);
                 } catch (Exception ignored) {}
             }
@@ -679,15 +685,19 @@ public class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
-                    if (!url.equals(currentBrowserUrl)) {
+                    String cleanNew = url.contains("#") ? url.substring(0, url.indexOf('#')) : url;
+                    String cleanCur = currentBrowserUrl != null && currentBrowserUrl.contains("#") ? currentBrowserUrl.substring(0, currentBrowserUrl.indexOf('#')) : (currentBrowserUrl != null ? currentBrowserUrl : "");
+                    if (!cleanNew.equals(cleanCur)) {
+                        currentPageGenId++;
                         currentBrowserUrl = url;
                         currentBrowserTitle = "";
+                        final long newGen = currentPageGenId;
                         if (webView != null) {
                             final String startUrl = url;
                             webView.post(new Runnable() {
                                 @Override
                                 public void run() {
-                                    webView.evaluateJavascript("if(window.onNativeBrowserPageStarted)window.onNativeBrowserPageStarted(" + JSONObject.quote(startUrl) + ");", null);
+                                    webView.evaluateJavascript("if(window.onNativeBrowserPageStarted)window.onNativeBrowserPageStarted(" + JSONObject.quote(startUrl) + "," + newGen + ");", null);
                                 }
                             });
                         }
@@ -711,6 +721,21 @@ public class MainActivity extends Activity {
         });
 
         WebChromeClient sharedChromeClient = new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, final int newProgress) {
+                super.onProgressChanged(view, newProgress);
+                if (view == browserWebView && webView != null) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                webView.evaluateJavascript("if(window.onNativePageLoadProgress)window.onNativePageLoadProgress(" + newProgress + ");", null);
+                            } catch (Exception ignored) {}
+                        }
+                    });
+                }
+            }
+
             @Override
             public void onReceivedTitle(WebView view, String title) {
                 super.onReceivedTitle(view, title);
@@ -1734,6 +1759,7 @@ public class MainActivity extends Activity {
                 job.isAudioOnly = isAudioOnly;
                 job.fileName = fileName;
                 job.subFolder = subFolder != null ? subFolder : "";
+                job.refererUrl = activity.currentBrowserUrl;
                 File baseTmp = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
                 if (baseTmp == null) baseTmp = activity.getCacheDir();
                 job.tempWorkDir = new File(baseTmp, "ytdlp_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_"));
@@ -1919,6 +1945,7 @@ public class MainActivity extends Activity {
                     activity.browserDesiredVisible = true;
                     activity.browserWebView.setVisibility(View.VISIBLE);
                     if (!url.equals(activity.currentBrowserUrl)) {
+                        activity.currentPageGenId++;
                         activity.currentBrowserUrl = url;
                         activity.currentBrowserTitle = "";
                         Map<String, String> extraHeaders = new HashMap<String, String>();
@@ -1956,6 +1983,44 @@ public class MainActivity extends Activity {
                     if (activity.browserWebView != null) {
                         activity.browserWebView.reload();
                     }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopNativeBrowserLoading() {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (activity.browserWebView != null) {
+                        activity.browserWebView.stopLoading();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void clearWebCookiesAndCache() {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        CookieManager cm = CookieManager.getInstance();
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                            cm.removeAllCookies(null);
+                            cm.flush();
+                        } else {
+                            cm.removeAllCookie();
+                        }
+                    } catch (Exception ignored) {}
+                    try { WebStorage.getInstance().deleteAllData(); } catch (Exception ignored) {}
+                    try {
+                        if (activity.browserWebView != null) {
+                            activity.browserWebView.clearCache(true);
+                            activity.browserWebView.clearHistory();
+                            activity.browserWebView.clearFormData();
+                        }
+                    } catch (Exception ignored) {}
                 }
             });
         }
