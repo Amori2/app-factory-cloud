@@ -6,7 +6,7 @@ android {
     applicationId "com.studio.appfactory"
     minSdk 24
     targetSdk 34
-    versionCode 15
+    versionCode 16
     versionName "11.0.0"
     
   }
