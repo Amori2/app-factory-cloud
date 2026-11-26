@@ -150,8 +150,18 @@ public class MainActivity extends Activity {
     private volatile String currentBrowserUrl = "";
     private volatile String currentBrowserTitle = "";
     private volatile long currentPageGenId = 1;
+    private volatile String lastEmbeddedIframeUrl = "";
     private boolean browserDesiredVisible = false;
     private int lastDetectedCount = 0;
+
+    // Chrome-style Multi-WebView LRU Tab Pool (keeps up to 6 active tabs alive in RAM with ZERO reload on switch!)
+    private final LinkedHashMap<String, WebView> tabWebViews = new LinkedHashMap<String, WebView>(8, 0.75f, true);
+    private String activeNativeTabId = "tab-1";
+    private static final int MAX_LIVE_TAB_WEBVIEWS = 6;
+    private WebViewClient sharedBrowserWebViewClient;
+    private WebChromeClient sharedBrowserChromeClient;
+    private DownloadListener sharedBrowserDownloadListener;
+    private WebAppBridge sharedWebAppBridge;
 
     private static final String[] AD_DOMAINS = new String[]{
         "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
@@ -406,6 +416,7 @@ public class MainActivity extends Activity {
             "if(!pt&&document.title)pt=document.title.trim();" +
             "if(window.AndroidBridge&&window.AndroidBridge.reportPageTitle&&pt)window.AndroidBridge.reportPageTitle(pt,location.href);" +
             "var seen={};function rep(u,q){if(!u||seen[u])return;seen[u]=1;try{u=new URL(u,location.href).href;}catch(e){}if(window.AndroidBridge&&window.AndroidBridge.reportDetectedMediaFromJs)window.AndroidBridge.reportDetectedMediaFromJs(u,pt,q||'');}" +
+            "var frms=document.querySelectorAll('iframe[src]');for(var fi=0;fi<frms.length;fi++){var fu=frms[fi].src||'';if(fu&&fu.indexOf('http')===0&&fu.indexOf('doubleclick')===-1&&fu.indexOf('googlesyndication')===-1&&fu.indexOf('exoclick')===-1){var fr=frms[fi].getBoundingClientRect();if(fr.width>=200&&fr.height>=120&&window.AndroidBridge&&window.AndroidBridge.reportEmbeddedIframe){window.AndroidBridge.reportEmbeddedIframe(fu);break;}}}" +
             "var els=document.querySelectorAll('video,audio,video source,audio source,source');" +
             "for(var i=0;i<els.length;i++){" +
             "var e=els[i];var u=e.currentSrc||e.src||e.getAttribute('src')||e.getAttribute('data-src')||'';" +
@@ -545,13 +556,14 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        WebAppBridge bridge = new WebAppBridge(this);
+        sharedWebAppBridge = new WebAppBridge(this);
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        webView.addJavascriptInterface(bridge, "AndroidBridge");
-        webView.addJavascriptInterface(bridge, "Android");
+        webView.addJavascriptInterface(sharedWebAppBridge, "AndroidBridge");
+        webView.addJavascriptInterface(sharedWebAppBridge, "Android");
 
         browserWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        browserWebView.addJavascriptInterface(bridge, "AndroidBridge");
+        browserWebView.addJavascriptInterface(sharedWebAppBridge, "AndroidBridge");
+        tabWebViews.put(activeNativeTabId, browserWebView);
         browserWebView.setOnTouchListener(new View.OnTouchListener() {
             private float pullStartY = -1f;
             private boolean pullTriggered = false;
@@ -623,7 +635,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        browserWebView.setWebViewClient(new WebViewClient() {
+        sharedBrowserWebViewClient = new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && request != null && request.getUrl() != null) {
@@ -718,9 +730,10 @@ public class MainActivity extends Activity {
                 injectDomMediaScannerIntoBrowser();
                 captureAndSendBrowserThumbnail(currentBrowserUrl);
             }
-        });
+        };
+        browserWebView.setWebViewClient(sharedBrowserWebViewClient);
 
-        WebChromeClient sharedChromeClient = new WebChromeClient() {
+        sharedBrowserChromeClient = new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, final int newProgress) {
                 super.onProgressChanged(view, newProgress);
@@ -862,10 +875,10 @@ public class MainActivity extends Activity {
             }
         };
 
-        webView.setWebChromeClient(sharedChromeClient);
-        browserWebView.setWebChromeClient(sharedChromeClient);
+        webView.setWebChromeClient(sharedBrowserChromeClient);
+        browserWebView.setWebChromeClient(sharedBrowserChromeClient);
 
-        DownloadListener sharedDownloadListener = new DownloadListener() {
+        sharedBrowserDownloadListener = new DownloadListener() {
             @Override
             public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
                 if (isSniffableMediaUrl(url)) {
@@ -882,8 +895,8 @@ public class MainActivity extends Activity {
             }
         };
 
-        webView.setDownloadListener(sharedDownloadListener);
-        browserWebView.setDownloadListener(sharedDownloadListener);
+        webView.setDownloadListener(sharedBrowserDownloadListener);
+        browserWebView.setDownloadListener(sharedBrowserDownloadListener);
 
         webView.loadUrl("file:///android_asset/index.html");
     }
@@ -1115,7 +1128,115 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
-        private void dispatchNextQueuedNativeJob() {
+        @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+    private WebView createPooledTabWebView(int topDp, int bottomDp) {
+        final WebView wv = new WebView(this);
+        wv.setBackgroundColor(Color.WHITE);
+        wv.setFocusable(true);
+        wv.setFocusableInTouchMode(true);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        lp.topMargin = dpToPx(topDp > 0 ? topDp : 142);
+        lp.bottomMargin = dpToPx(bottomDp > 0 ? bottomDp : 58);
+        wv.setLayoutParams(lp);
+        wv.setVisibility(View.GONE);
+        configureCommonWebSettings(wv.getSettings());
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
+            }
+        } catch (Exception ignored) {}
+        wv.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        if (sharedWebAppBridge != null) wv.addJavascriptInterface(sharedWebAppBridge, "AndroidBridge");
+        if (sharedBrowserWebViewClient != null) wv.setWebViewClient(sharedBrowserWebViewClient);
+        if (sharedBrowserChromeClient != null) wv.setWebChromeClient(sharedBrowserChromeClient);
+        if (sharedBrowserDownloadListener != null) wv.setDownloadListener(sharedBrowserDownloadListener);
+        wv.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                WebView.HitTestResult hr = wv.getHitTestResult();
+                if (hr == null) return false;
+                int type = hr.getType();
+                String extra = hr.getExtra();
+                if (extra != null && (extra.startsWith("http://") || extra.startsWith("https://"))) {
+                    if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE ||
+                        type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE ||
+                        type == WebView.HitTestResult.IMAGE_TYPE) {
+                        showLongPressLinkDialog(extra, "");
+                        return true;
+                    }
+                }
+                return false;
+            }
+        });
+        wv.setOnTouchListener(new View.OnTouchListener() {
+            private float pullStartY = -1f;
+            private boolean pullTriggered = false;
+            @Override
+            public boolean onTouch(View v, MotionEvent ev) {
+                int action = ev.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    pullStartY = (wv.getScrollY() == 0) ? ev.getRawY() : -1f;
+                    pullTriggered = false;
+                } else if (action == MotionEvent.ACTION_MOVE && pullStartY >= 0f && !pullTriggered) {
+                    if (wv.getScrollY() > 0) {
+                        pullStartY = -1f;
+                    } else if ((ev.getRawY() - pullStartY) > dpToPx(110)) {
+                        pullTriggered = true;
+                        Toast.makeText(MainActivity.this, "جاري تحديث الصفحة...", Toast.LENGTH_SHORT).show();
+                        wv.reload();
+                    }
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    pullStartY = -1f;
+                    pullTriggered = false;
+                }
+                return false;
+            }
+        });
+        int fabIdx = rootLayout.indexOfChild(nativeFabBtn);
+        if (fabIdx >= 0) rootLayout.addView(wv, fabIdx);
+        else rootLayout.addView(wv);
+        return wv;
+    }
+
+    private File writeTempCookiesFileForUrl(String urlStr) {
+        try {
+            String rawCookie = CookieManager.getInstance().getCookie(urlStr);
+            if (rawCookie == null || rawCookie.trim().isEmpty()) return null;
+            Uri uri = Uri.parse(urlStr);
+            String host = uri.getHost();
+            if (host == null || host.isEmpty()) return null;
+            String domain = host.startsWith("www.") ? host.substring(3) : ("." + host);
+            File cf = new File(getCacheDir(), "cruz_cookies_" + Math.abs(host.hashCode()) + ".txt");
+            StringBuilder sb = new StringBuilder();
+            sb.append("# Netscape HTTP Cookie File").append((char) 10);
+            String[] pairs = rawCookie.split(";");
+            for (String p : pairs) {
+                int eq = p.indexOf('=');
+                if (eq > 0) {
+                    String k = p.substring(0, eq).trim();
+                    String v = p.substring(eq + 1).trim();
+                    if (!k.isEmpty()) {
+                        sb.append(domain).append((char) 9).append("TRUE").append((char) 9).append("/").append((char) 9)
+                          .append("TRUE").append((char) 9).append("2147483647").append((char) 9)
+                          .append(k).append((char) 9).append(v).append((char) 10);
+                    }
+                }
+            }
+            FileOutputStream fos = new FileOutputStream(cf);
+            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.flush();
+            fos.close();
+            return cf;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String performYtdlpSelfUpdateSync() {
+        return "ERROR:yt-dlp disabled";
+    }
+
+    private void dispatchNextQueuedNativeJob() {
         while (true) {
             final NativeDownloadJob nextJob;
             synchronized (queueLock) {
@@ -1322,17 +1443,65 @@ public class MainActivity extends Activity {
         }
     }
 
+    private HttpURLConnection openDirectMediaConnection(String startUrl, String refererUrl, long rangeStart) throws Exception {
+        String current = startUrl;
+        for (int hop = 0; hop < 8; hop++) {
+            URL u = new URL(current);
+            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+            conn.setConnectTimeout(30000);
+            conn.setReadTimeout(60000);
+            conn.setInstanceFollowRedirects(false);
+            conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
+            conn.setRequestProperty("Accept", "*/*");
+            conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9,ar;q=0.8");
+            conn.setRequestProperty("Connection", "keep-alive");
+            conn.setRequestProperty("Sec-Fetch-Dest", "video");
+            conn.setRequestProperty("Sec-Fetch-Mode", "no-cors");
+            if (refererUrl != null && !refererUrl.isEmpty()) {
+                conn.setRequestProperty("Referer", refererUrl);
+                try {
+                    Uri ru = Uri.parse(refererUrl);
+                    if (ru.getScheme() != null && ru.getHost() != null) {
+                        conn.setRequestProperty("Origin", ru.getScheme() + "://" + ru.getHost());
+                    }
+                } catch (Exception ignored) {}
+            }
+            String cookies = CookieManager.getInstance().getCookie(current);
+            if ((cookies == null || cookies.isEmpty()) && refererUrl != null && !refererUrl.isEmpty()) {
+                cookies = CookieManager.getInstance().getCookie(refererUrl);
+            }
+            if (cookies != null && !cookies.isEmpty()) {
+                conn.setRequestProperty("Cookie", cookies);
+            }
+            if (rangeStart > 0) {
+                conn.setRequestProperty("Range", "bytes=" + rangeStart + "-");
+            }
+            int code = conn.getResponseCode();
+            if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+                String loc = conn.getHeaderField("Location");
+                conn.disconnect();
+                if (loc == null || loc.trim().isEmpty()) throw new Exception("Empty redirect");
+                URL nextU = new URL(u, loc.trim());
+                current = nextU.toString();
+                continue;
+            }
+            return conn;
+        }
+        throw new Exception("Too many redirects");
+    }
+
     private void runDirectHttpJobSync(NativeDownloadJob job) {
         FileOutputStream fos = null;
         InputStream is = null;
         HttpURLConnection conn = null;
+        boolean shouldFallbackYtdlp = false;
         try {
             long existingBytes = (job.tempFile != null && job.tempFile.exists()) ? job.tempFile.length() : 0;
             job.downloadedBytes = existingBytes;
             int retries = 0;
             double ewmaSpeed = 0.0;
 
-            while (retries <= 6 && !job.paused && !job.canceled && job.running) {
+            while (retries <= 4 && !job.paused && !job.canceled && job.running) {
                 int offlineWait = 0;
                 while (!isNetworkAvailable() && offlineWait < 60 && !job.paused && !job.canceled && job.running) {
                     emitNativeJobProgressToUi(job.jobId, job.lastPercent, 100, job.downloadedBytes, job.totalBytes, 0, job.lastPercent, "Waiting", "بانتظار عودة الإنترنت...");
@@ -1340,26 +1509,30 @@ public class MainActivity extends Activity {
                     offlineWait++;
                 }
                 try {
-                    URL u = new URL(job.sourceUrl);
-                    conn = (HttpURLConnection) u.openConnection();
-                    conn.setConnectTimeout(30000);
-                    conn.setReadTimeout(60000);
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setRequestProperty("User-Agent", MOBILE_CHROME_UA);
-                    conn.setRequestProperty("Connection", "keep-alive");
-                    if (job.refererUrl != null && !job.refererUrl.isEmpty()) {
-                        conn.setRequestProperty("Referer", job.refererUrl);
-                    }
-                    String cookies = CookieManager.getInstance().getCookie(job.sourceUrl);
-                    if (cookies != null && !cookies.isEmpty()) {
-                        conn.setRequestProperty("Cookie", cookies);
-                    }
-                    if (existingBytes > 0) {
-                        conn.setRequestProperty("Range", "bytes=" + existingBytes + "-");
-                    }
+                    conn = openDirectMediaConnection(job.sourceUrl, job.refererUrl, existingBytes);
                     int code = conn.getResponseCode();
+                    if ((code == 416 || code == 403) && existingBytes > 0) {
+                        conn.disconnect();
+                        existingBytes = 0;
+                        job.downloadedBytes = 0;
+                        conn = openDirectMediaConnection(job.sourceUrl, job.refererUrl, 0);
+                        code = conn.getResponseCode();
+                    }
+                    String ct = conn.getContentType();
+                    if (ct != null && (ct.toLowerCase().contains("text/html") || ct.toLowerCase().contains("application/json"))) {
+                        conn.disconnect();
+                        conn = null;
+                        shouldFallbackYtdlp = true;
+                        break;
+                    }
                     boolean appendMode = (code == 206 && existingBytes > 0);
                     if (!appendMode && (code < 200 || code >= 300)) {
+                        if (code == 403 || code == 401 || code == 410) {
+                            conn.disconnect();
+                            conn = null;
+                            shouldFallbackYtdlp = true;
+                            break;
+                        }
                         throw new Exception("HTTP " + code);
                     }
                     long contentLen = conn.getContentLengthLong();
@@ -1403,6 +1576,9 @@ public class MainActivity extends Activity {
                     is = null;
                     conn.disconnect();
                     conn = null;
+                    if (job.downloadedBytes < 8192 && !job.paused && !job.canceled) {
+                        shouldFallbackYtdlp = true;
+                    }
                     break;
                 } catch (Exception netErr) {
                     try { if (fos != null) fos.close(); } catch (Exception ignored) {}
@@ -1410,9 +1586,24 @@ public class MainActivity extends Activity {
                     if (conn != null) conn.disconnect();
                     fos = null; is = null; conn = null;
                     retries++;
-                    if (retries > 6 || job.paused || job.canceled) throw netErr;
+                    if (retries > 4 || job.paused || job.canceled) {
+                        shouldFallbackYtdlp = true;
+                        break;
+                    }
                     try { Thread.sleep(1500L * retries); } catch (Exception ignored) {}
                 }
+            }
+
+            // Automatic seamless fallback to embedded yt-dlp when direct MP4 returns 403/HTML or stalls!
+            if (shouldFallbackYtdlp && !job.paused && !job.canceled) {
+                try { if (job.tempFile != null && job.tempFile.exists()) job.tempFile.delete(); } catch (Exception ignored) {}
+                File baseTmp = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                if (baseTmp == null) baseTmp = getCacheDir();
+                job.tempWorkDir = new File(baseTmp, "ytdlp_fb_" + job.jobId.replaceAll("[^a-zA-Z0-9_-]", "_"));
+                job.type = NativeDownloadJob.TYPE_YTDLP;
+                job.formatSelector = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
+                runYtdlpJobSync(job);
+                return;
             }
 
             if (job.canceled) {
@@ -1737,6 +1928,34 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void updateYtdlpEngine() {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final String res = activity.performYtdlpSelfUpdateSync();
+                    activity.runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (activity.webView != null) {
+                                boolean ok = res != null && res.startsWith("OK:");
+                                String js = "if(window.onYtdlpUpdateResult)window.onYtdlpUpdateResult(" +
+                                    (ok ? "true" : "false") + "," + JSONObject.quote(res != null ? res : "") + ");";
+                                activity.webView.evaluateJavascript(js, null);
+                            }
+                        }
+                    });
+                }
+            }).start();
+        }
+
+        @JavascriptInterface
+        public void reportEmbeddedIframe(String iframeUrl) {
+            if (iframeUrl != null && (iframeUrl.startsWith("http://") || iframeUrl.startsWith("https://"))) {
+                activity.lastEmbeddedIframeUrl = iframeUrl;
+            }
+        }
+
+        @JavascriptInterface
         public void extractMediaWithYtdlp(final String requestId, final String targetUrl) {
             
         }
@@ -1934,26 +2153,97 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void openNativeBrowser(final String url, final int topDp, final int bottomDp) {
+            openNativeBrowserForTab(activity.activeNativeTabId, url, topDp, bottomDp, false);
+        }
+
+        @JavascriptInterface
+        public void openNativeBrowserForTab(final String tabId, final String url, final int topDp, final int bottomDp, final boolean forceReload) {
             activity.runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    if (activity.browserWebView == null || url == null) return;
-                    FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) activity.browserWebView.getLayoutParams();
-                    lp.topMargin = activity.dpToPx(topDp > 0 ? topDp : 106);
+                    if (url == null) return;
+                    String tid = (tabId != null && !tabId.trim().isEmpty()) ? tabId.trim() : "tab-1";
+
+                    // Hide previously active tab WebView WITHOUT destroying or reloading it!
+                    if (activity.browserWebView != null && !tid.equals(activity.activeNativeTabId)) {
+                        activity.browserWebView.setVisibility(View.GONE);
+                        try { activity.browserWebView.onPause(); } catch (Exception ignored) {}
+                    }
+
+                    WebView targetWv = activity.tabWebViews.get(tid);
+                    boolean isNewWv = false;
+                    if (targetWv == null) {
+                        // Evict least-recently-used hidden tab if pool exceeds MAX_LIVE_TAB_WEBVIEWS
+                        while (activity.tabWebViews.size() >= MAX_LIVE_TAB_WEBVIEWS) {
+                            String oldestKey = null;
+                            for (String k : activity.tabWebViews.keySet()) {
+                                if (!k.equals(tid) && !k.equals(activity.activeNativeTabId)) {
+                                    oldestKey = k;
+                                    break;
+                                }
+                            }
+                            if (oldestKey == null) break;
+                            WebView oldWv = activity.tabWebViews.remove(oldestKey);
+                            if (oldWv != null) {
+                                try { activity.rootLayout.removeView(oldWv); oldWv.destroy(); } catch (Exception ignored) {}
+                            }
+                        }
+                        targetWv = activity.createPooledTabWebView(topDp, bottomDp);
+                        activity.tabWebViews.put(tid, targetWv);
+                        isNewWv = true;
+                    }
+
+                    activity.activeNativeTabId = tid;
+                    activity.browserWebView = targetWv;
+                    FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) targetWv.getLayoutParams();
+                    lp.topMargin = activity.dpToPx(topDp > 0 ? topDp : 142);
                     lp.bottomMargin = activity.dpToPx(bottomDp > 0 ? bottomDp : 58);
-                    activity.browserWebView.setLayoutParams(lp);
+                    targetWv.setLayoutParams(lp);
                     activity.browserDesiredVisible = true;
-                    activity.browserWebView.setVisibility(View.VISIBLE);
-                    if (!url.equals(activity.currentBrowserUrl)) {
+                    targetWv.setVisibility(View.VISIBLE);
+                    try { targetWv.onResume(); } catch (Exception ignored) {}
+                    if (activity.nativeFabBtn != null) activity.nativeFabBtn.bringToFront();
+
+                    String loadedUrl = targetWv.getUrl();
+                    boolean alreadyLoaded = !isNewWv && loadedUrl != null && !loadedUrl.isEmpty() && !"about:blank".equals(loadedUrl);
+                    if (forceReload || !alreadyLoaded || (loadedUrl != null && !loadedUrl.split("#")[0].equals(url.split("#")[0]) && isNewWv)) {
                         activity.currentPageGenId++;
+                        activity.lastEmbeddedIframeUrl = "";
                         activity.currentBrowserUrl = url;
                         activity.currentBrowserTitle = "";
                         Map<String, String> extraHeaders = new HashMap<String, String>();
                         extraHeaders.put("X-Requested-With", "");
-                        activity.browserWebView.loadUrl(url, extraHeaders);
+                        targetWv.loadUrl(url, extraHeaders);
+                    } else {
+                        // Instant tab switch from RAM with ZERO reload!
+                        activity.currentBrowserUrl = loadedUrl;
+                        String t = targetWv.getTitle();
+                        activity.currentBrowserTitle = (t != null) ? t : "";
+                        activity.notifyUiBrowserState(activity.currentBrowserUrl, activity.currentBrowserTitle);
                     }
                     if (activity.lastDetectedCount > 0 && activity.nativeFabBtn != null) {
                         activity.nativeFabBtn.setVisibility(View.VISIBLE);
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void closeNativeTab(final String tabId) {
+            if (tabId == null || tabId.trim().isEmpty()) return;
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    WebView removed = activity.tabWebViews.remove(tabId.trim());
+                    if (removed != null) {
+                        try {
+                            removed.setVisibility(View.GONE);
+                            activity.rootLayout.removeView(removed);
+                            removed.destroy();
+                        } catch (Exception ignored) {}
+                        if (removed == activity.browserWebView) {
+                            activity.browserWebView = null;
+                        }
                     }
                 }
             });
@@ -1965,8 +2255,12 @@ public class MainActivity extends Activity {
                 @Override
                 public void run() {
                     activity.browserDesiredVisible = visible;
-                    if (activity.browserWebView != null) {
-                        activity.browserWebView.setVisibility(visible ? View.VISIBLE : View.GONE);
+                    if (!visible) {
+                        for (WebView w : activity.tabWebViews.values()) {
+                            if (w != null) w.setVisibility(View.GONE);
+                        }
+                    } else if (activity.browserWebView != null) {
+                        activity.browserWebView.setVisibility(View.VISIBLE);
                     }
                     if (activity.nativeFabBtn != null) {
                         activity.nativeFabBtn.setVisibility((visible && activity.lastDetectedCount > 0) ? View.VISIBLE : View.GONE);
